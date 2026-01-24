@@ -34,3 +34,30 @@ pip install "numpy<2"
 echo "==========================success install=========================="
 
 
+
+
+
+# =======================================================
+# git remote add origin https://github.com/xuexutao/GS_dev.git
+# git branch -M main
+# git push -u origin main
+# ===================git config==========================
+# git config --global user.name "xuexutao"
+# git config --global user.email "645193045@qq.com"
+# 新建一个ssh key
+# ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_xuexutao -C "645193045@qq.com"
+# cat ~/.ssh/id_ed25519_xuexutao.pub
+# 复制到: GitHub → Settings → SSH and GPG keys → New SSH key
+# vim ~/.ssh/config
+    # 添加
+    # Host github-xuexutao
+    #     HostName github.com
+    #     User git
+    #     IdentityFile ~/.ssh/id_ed25519_xuexutao
+# 测试连接
+# git remote set-url origin git@github-xuexutao:xuexutao/GS_dev.git
+# ssh -T git@github-xuexutao
+# 成功后，会显示：
+# Hi xuexutao! You've successfully authenticated, but GitHub does not provide shell access.
+# git push -u origin main
+# =======================================================
