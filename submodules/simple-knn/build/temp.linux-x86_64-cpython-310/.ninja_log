@@ -1,0 +1,4 @@
+# ninja log v5
+9	17223	1769274029337683000	/mnt/bn/isp-traindata-lf-2/xxt/workspace/new_demo/gaussian-splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/ext.o	297ff203cbce88e7
+10	22911	1769274035025825000	/mnt/bn/isp-traindata-lf-2/xxt/workspace/new_demo/gaussian-splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/simple_knn.o	2dcda86e32c0af82
+10	51851	1769274063968126000	/mnt/bn/isp-traindata-lf-2/xxt/workspace/new_demo/gaussian-splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/spatial.o	f73927f9ce3362b1
