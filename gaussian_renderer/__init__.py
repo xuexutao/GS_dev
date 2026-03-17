@@ -11,11 +11,24 @@
 
 import torch
 import math
+from typing import Optional
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    scaling_modifier=1.0,
+    separate_sh=False,
+    override_color=None,
+    use_trained_exp=False,
+    mask: Optional[torch.Tensor] = None,
+    use_masked_rasterizer: bool = False,
+    apply_mask_in_forward: bool = True,
+):
     """
     Render the scene. 
     
@@ -49,7 +62,17 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         antialiasing=pipe.antialiasing
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    use_masked = use_masked_rasterizer and mask is not None
+    if use_masked:
+        try:
+            from masked_diff_gaussian_rasterization import GaussianRasterizer as MaskedGaussianRasterizer
+        except Exception as e:
+            raise ImportError(
+                "masked_diff_gaussian_rasterization not found. Install submodules/masked-diff-gaussian-rasterization."
+            ) from e
+        rasterizer = MaskedGaussianRasterizer(raster_settings=raster_settings)
+    else:
+        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     means3D = pc.get_xyz
     means2D = screenspace_points
@@ -88,26 +111,57 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     if separate_sh:
-        rendered_image, radii, depth_image = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            dc = dc,
-            shs = shs,
-            colors_precomp = colors_precomp,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
+        if use_masked:
+            rendered_image, radii, depth_image = rasterizer(
+                means3D=means3D,
+                means2D=means2D,
+                dc=dc,
+                shs=shs,
+                colors_precomp=colors_precomp,
+                opacities=opacity,
+                scales=scales,
+                rotations=rotations,
+                cov3D_precomp=cov3D_precomp,
+                mask=mask,
+                apply_mask_in_forward=apply_mask_in_forward,
+            )
+        else:
+            rendered_image, radii, depth_image = rasterizer(
+                means3D=means3D,
+                means2D=means2D,
+                dc=dc,
+                shs=shs,
+                colors_precomp=colors_precomp,
+                opacities=opacity,
+                scales=scales,
+                rotations=rotations,
+                cov3D_precomp=cov3D_precomp,
+            )
     else:
-        rendered_image, radii, depth_image = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            shs = shs,
-            colors_precomp = colors_precomp,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
+        if use_masked:
+            rendered_image, radii, depth_image = rasterizer(
+                means3D=means3D,
+                means2D=means2D,
+                shs=shs,
+                colors_precomp=colors_precomp,
+                opacities=opacity,
+                scales=scales,
+                rotations=rotations,
+                cov3D_precomp=cov3D_precomp,
+                mask=mask,
+                apply_mask_in_forward=apply_mask_in_forward,
+            )
+        else:
+            rendered_image, radii, depth_image = rasterizer(
+                means3D=means3D,
+                means2D=means2D,
+                shs=shs,
+                colors_precomp=colors_precomp,
+                opacities=opacity,
+                scales=scales,
+                rotations=rotations,
+                cov3D_precomp=cov3D_precomp,
+            )
         
     # Apply exposure to rendered image (training only)
     if use_trained_exp:

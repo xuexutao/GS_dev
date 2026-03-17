@@ -56,6 +56,7 @@ class ModelParams(ParamGroup):
         self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
+        self.start_type = 'train'
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -97,6 +98,17 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+
+        # =========================
+        # Masked training (SAM)
+        # =========================
+        self.mask_loss_weight = 0.0
+        self.mask_dirname = "masks_sam"  # under <source_path>/<images>/
+        self.mask_max_objects = 16
+        self.mask_min_coverage = 0.001  # ignore tiny masks (ratio of pixels)
+        self.mask_use_masked_rasterizer = False
+        self.mask_pack_loss = False
+        self.mask_pack_size = 512
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

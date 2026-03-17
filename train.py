@@ -20,6 +20,10 @@ from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+import glob
+from PIL import Image
+import torch.nn.functional as F
+import numpy as np
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -67,6 +71,94 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+
+    mask_cache = {}
+
+    def _load_object_masks_for_view(viewpoint_cam):
+        """Load list of object masks (1,H,W) in [0,1], resized to current training resolution."""
+        key = (viewpoint_cam.image_name, int(viewpoint_cam.image_height), int(viewpoint_cam.image_width))
+        if key in mask_cache:
+            return mask_cache[key]
+
+        stem = os.path.splitext(os.path.basename(viewpoint_cam.image_name))[0]
+        mask_dir = os.path.join(dataset.source_path, dataset.images, opt.mask_dirname, stem)
+        if not os.path.isdir(mask_dir):
+            mask_cache[key] = []
+            return []
+
+        paths = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
+        if not paths:
+            mask_cache[key] = []
+            return []
+
+        # Load masks as float tensor on CPU first
+        masks = []
+        H, W = int(viewpoint_cam.image_height), int(viewpoint_cam.image_width)
+        for p in paths[: int(opt.mask_max_objects)]:
+            m = Image.open(p).convert("L")
+            m = torch.from_numpy(np.array(m, dtype=np.uint8)).float() / 255.0
+            if m.shape[0] != H or m.shape[1] != W:
+                m = F.interpolate(m[None, None, ...], size=(H, W), mode="nearest")[0, 0]
+            masks.append(m[None, ...])
+
+        if not masks:
+            mask_cache[key] = []
+            return []
+
+        # Filter tiny masks
+        out = []
+        total = float(H * W)
+        for m in masks:
+            cov = float((m > 0.5).sum().item()) / max(total, 1.0)
+            if cov >= float(opt.mask_min_coverage):
+                out.append(m)
+        mask_cache[key] = out
+        return out
+
+    def _masked_l1(img, gt, mask_1hw):
+        # img/gt: (3,H,W), mask: (1,H,W)
+        mask3 = mask_1hw.expand_as(img)
+        diff = torch.abs(img - gt) * mask3
+        denom = mask3.sum().clamp_min(1.0)
+        return diff.sum() / denom
+
+    def _packed_mask_loss(img, gt, masks_1hw, pack_size: int):
+        """Pack multiple masked crops into a pack_size x pack_size atlas and compute L1."""
+        n = len(masks_1hw)
+        if n == 0:
+            return None
+        grid = int(np.ceil(np.sqrt(n)))
+        tile = max(int(pack_size // grid), 1)
+        atlas_img = torch.zeros((3, pack_size, pack_size), device=img.device, dtype=img.dtype)
+        atlas_gt = torch.zeros((3, pack_size, pack_size), device=gt.device, dtype=gt.dtype)
+
+        placed = 0
+        for i, m in enumerate(masks_1hw):
+            if placed >= grid * grid:
+                break
+            ys, xs = torch.where(m[0] > 0.5)
+            if ys.numel() == 0:
+                continue
+            y0, y1 = int(ys.min().item()), int(ys.max().item()) + 1
+            x0, x1 = int(xs.min().item()), int(xs.max().item()) + 1
+            # crop and apply mask
+            crop_m = m[:, y0:y1, x0:x1]
+            crop_img = img[:, y0:y1, x0:x1] * crop_m
+            crop_gt = gt[:, y0:y1, x0:x1] * crop_m
+
+            crop_img = F.interpolate(crop_img[None], size=(tile, tile), mode="bilinear", align_corners=False)[0]
+            crop_gt = F.interpolate(crop_gt[None], size=(tile, tile), mode="bilinear", align_corners=False)[0]
+
+            r = placed // grid
+            c = placed % grid
+            oy, ox = r * tile, c * tile
+            atlas_img[:, oy : oy + tile, ox : ox + tile] = crop_img
+            atlas_gt[:, oy : oy + tile, ox : ox + tile] = crop_gt
+            placed += 1
+
+        if placed == 0:
+            return None
+        return torch.abs(atlas_img - atlas_gt).mean()
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -128,6 +220,53 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        # Mask loss (optional): full-image loss + object-mask losses
+        if opt.mask_loss_weight > 0.0:
+            obj_masks = _load_object_masks_for_view(viewpoint_cam)
+            if obj_masks:
+                obj_masks = [m.to(device=image.device) for m in obj_masks]
+                union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
+
+                # Per-object masked loss on current rendered image
+                per_obj = 0.0
+                for m in obj_masks:
+                    per_obj = per_obj + _masked_l1(image, gt_image, m)
+                per_obj = per_obj / float(len(obj_masks))
+
+                # Optional: run a second render path that uses masked rasterizer (mask applied in forward/backward)
+                if opt.mask_use_masked_rasterizer:
+                    # Ensure the module is importable even without pip install
+                    masked_submodule = os.path.join(os.path.dirname(__file__), "submodules", "masked-diff-gaussian-rasterization")
+                    if masked_submodule not in sys.path:
+                        sys.path.insert(0, masked_submodule)
+
+                    render_pkg_masked = render(
+                        viewpoint_cam,
+                        gaussians,
+                        pipe,
+                        bg,
+                        use_trained_exp=dataset.train_test_exp,
+                        separate_sh=SPARSE_ADAM_AVAILABLE,
+                        mask=union_mask,
+                        use_masked_rasterizer=True,
+                        apply_mask_in_forward=True,
+                    )
+                    image_masked = render_pkg_masked["render"]
+                    union_obj = _masked_l1(image_masked, gt_image, union_mask)
+                else:
+                    union_obj = _masked_l1(image, gt_image, union_mask)
+
+                if opt.mask_pack_loss:
+                    packed = _packed_mask_loss(image, gt_image, obj_masks, int(opt.mask_pack_size))
+                else:
+                    packed = None
+
+                if packed is None:
+                    mask_loss = 0.5 * union_obj + 0.5 * per_obj
+                else:
+                    mask_loss = (union_obj + per_obj + packed) / 3.0
+                loss = loss + float(opt.mask_loss_weight) * mask_loss
 
         # Depth regularization
         Ll1depth_pure = 0.0
