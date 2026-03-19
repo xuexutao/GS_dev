@@ -187,12 +187,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Perform near culling, quit if outside.
 	float3 p_view;
-	if (idx < 1){
-		printf("0、idx=%d | viewmatrix[0-11]: %.4f, %.4f, %.4f, %.4f | %.4f, %.4f, %.4f, %.4f | %.4f, %.4f, %.4f, %.4f | %.4f, %.4f, %.4f, %.4f\n", 
-			idx, viewmatrix[0], viewmatrix[1], viewmatrix[2], viewmatrix[3], viewmatrix[4], viewmatrix[5], viewmatrix[6], viewmatrix[7], viewmatrix[8], viewmatrix[9], viewmatrix[10], viewmatrix[11]);
-		printf("0、idx=%d | projmatrix[0-11]: %.4f, %.4f, %.4f, %.4f | %.4f, %.4f, %.4f, %.4f | %.4f, %.4f, %.4f, %.4f | %.4f, %.4f, %.4f, %.4f\n", 
-			idx, projmatrix[0], projmatrix[1], projmatrix[2], projmatrix[3], projmatrix[4], projmatrix[5], projmatrix[6], projmatrix[7],projmatrix[8], projmatrix[9], projmatrix[10], projmatrix[11]);
-	}
+	// (debug printf removed)
 
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
@@ -203,12 +198,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
-	if (idx < 10){
-		printf("1、idx=%d | p_orig: (%.4f, %.4f, %.4f) -> p_proj: (%.4f, %.4f, %.4f)\n", 
-			idx, p_orig.x, p_orig.y, p_orig.z, p_proj.x, p_proj.y, p_proj.z);
-		printf("\t idx=%d | projmatrix[0-15] sample: %.4f, %.4f, %.4f, %.4f\n", 
-			idx, projmatrix[0], projmatrix[4], projmatrix[8], projmatrix[12]);
-	}
+	// (debug printf removed)
 
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
 	// from scaling and rotation parameters. 
@@ -225,9 +215,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Compute 2D screen-space covariance matrix
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
-	if (idx < 10){
-		printf("2、idx=%d | cov: (%.4f, %.4f, %.4f)\n", idx, cov.x, cov.y, cov.z);
-	}
+	// (debug printf removed)
 
 	constexpr float h_var = 0.3f;
 	const float det_cov = cov.x * cov.z - cov.y * cov.y;
@@ -245,9 +233,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		return;
 	float det_inv = 1.f / det;
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv }; // 高斯球的2D空间的协方差矩阵的逆
-	if (idx < 10){
-		printf("3、idx=%d | conic: (%.4f, %.4f, %.4f)\n", idx, conic.x, conic.y, conic.z);
-	}
+	// (debug printf removed)
 
 	// Compute extent in screen space (by finding eigenvalues of
 	// 2D covariance matrix). Use extent to compute a bounding rectangle

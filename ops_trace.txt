@@ -1,0 +1,94 @@
+时间：2026-03-19
+仓库：/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev
+
+====================
+1) 计算环境确认
+====================
+- GPU worker：`mlx worker login 3690051`
+- nvcc：CUDA 12.1 (`nvcc -V`)
+- torch：2.1.0+cu121，GPU：NVIDIA A100-SXM4-80GB
+- conda 环境：实际存在的环境名为 `gaussian`（未发现名为 `gsussian` 的 env）
+
+====================
+2) SAM 全分割 + 多视图一致性
+====================
+目标：对每张图生成所有物体的 mask，并通过 COLMAP tracks 进行跨视角 obj_id 对齐。
+
+关键代码：
+- `utils/multiview_sam_mask.py`
+  - 通过 `submodules/segment-anything` 调用 SAM AutomaticMaskGenerator
+  - 通过 COLMAP `points3D` 的 track，将 (image_id, mask_idx) 构图并 union-find 合并成全局 obj_id
+  - 输出目录形如：`<source>/<images_subdir>/<out_subdir>/<image_stem>/obj_XXXX.png`
+- `generate_multiview_sam_masks.py`
+  - 增加 `--summary_topk`：生成后统计每个 obj 在多视角总面积与出现视角数，便于挑选 `mask_object_id`
+
+本次验证用子集（加速）：
+- 使用 `data/gs_data/bicycle/images_8`（低分辨率）生成 masks：
+  - `--source_path data/gs_data/bicycle`
+  - `--images_subdir images_8`
+  - `--out_subdir images_8/masks_sam`
+  - checkpoint：`third_model/Grounded-Segment-Anything/sam_vit_h_4b8939.pth`
+  - 例：`--max_images 20 --points_per_side 8 --min_shared_points 2`
+
+产物目录：
+- `data/gs_data/bicycle/images_8/masks_sam/`（每张图一个子目录，内含若干 `obj_*.png`）
+
+全量生成：
+- 已对 `data/gs_data/bicycle/images_8` 全部视角（194 张）生成同一套 `obj_XXXX.png`，输出仍为：
+  - `data/gs_data/bicycle/images_8/masks_sam/`
+
+====================
+3) masked-diff-gaussian-rasterization（可 pip install）
+====================
+目标：实现一个单独可安装的 rasterizer 包，用于在 forward/backward 中应用 mask（本次实现为：在 Python autograd 里对输出/梯度做 mask gating；CUDA 扩展从 upstream 源码复用编译）。
+
+关键改动：
+- `submodules/masked-diff-gaussian-rasterization/setup.py`
+  - 使用 `torch.utils.cpp_extension.CUDAExtension` 编译生成 `masked_diff_gaussian_rasterization._C`
+  - 复用 `submodules/diff-gaussian-rasterization` 的源码路径作为 sources
+- `submodules/masked-diff-gaussian-rasterization/masked_diff_gaussian_rasterization/__init__.py`
+  - 从 `from diff_gaussian_rasterization import _C` 改为 `from . import _C`
+  - 保留 `mask`/`apply_mask_in_forward` 参数：在 forward/backward 中对 color/depth 的梯度做 mask
+
+安装命令（避免 editable/PEP517 的 torch 缺失问题）：
+- `pip install ./submodules/masked-diff-gaussian-rasterization --no-build-isolation`
+
+额外：
+- 去掉了上游 forward.cu 内的调试 printf（否则训练日志极大）：
+  - `submodules/diff-gaussian-rasterization/cuda_rasterizer/forward.cu`
+  - 修改后重新 `pip install --force-reinstall ./submodules/masked-diff-gaussian-rasterization --no-build-isolation`
+
+====================
+4) 训练侧接入与 object-only 重建
+====================
+关键逻辑：
+- `scene/dataset_readers.py`
+  - `build_object_pointcloud_from_colmap_masks(...)`：用 mask 对 COLMAP points3D 进行投票筛选，作为 object-only 初始化点云
+- `scene/__init__.py`
+  - 当 `mask_only=True` 且 `mask_object_id>=0` 时，调用上面的 points3D 筛选
+- `gaussian_renderer/__init__.py`
+  - 支持 `mask` + `use_masked_rasterizer=True`：使用 `masked_diff_gaussian_rasterization.GaussianRasterizer`
+- `arguments/__init__.py`
+  - 增加 mask 相关参数：`mask_only/mask_object_id/mask_dirname/...`
+- `train.py`
+  - 修复：不要把 `submodules/masked-diff-gaussian-rasterization` 强行插入 `sys.path`（否则会导入源码包而找不到已安装的 `_C`）
+  - 优化：当 `mask_only && mask_use_masked_rasterizer` 时，主 render 直接走 masked rasterizer，避免触发未 masking 的 render（也避免某些 build 的 CUDA debug 输出）
+
+====================
+5) 端到端跑通（bicycle 单物体 PLY）
+====================
+训练命令（A100 worker，conda env=gaussian）：
+- `python train.py -s data/gs_data/bicycle --images images_8 --model_path output/bicycle_obj0002 \
+   --iterations 7000 --save_iterations 7000 --test_iterations 7000 --disable_viewer \
+   --mask_only --mask_object_id 2 --mask_dirname masks_sam --mask_use_masked_rasterizer --mask_points3d_min_ratio 0.4`
+
+输出文件：
+- `output/bicycle_obj0002/point_cloud/iteration_7000/point_cloud.ply`
+- 点数统计（Gaussians 数）：1271945（见 `count_ply_vertices.py`）
+
+====================
+附：临时脚本
+====================
+- `env_check.py`：打印 torch/cuda/gpu 信息
+- `masked_rasterizer_check.py`：验证 `masked_diff_gaussian_rasterization` 可导入
+- `count_ply_vertices.py`：统计输出 ply 的 vertex 数

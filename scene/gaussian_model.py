@@ -471,5 +471,10 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
+        # Some rasterizer/masking configurations may not backpropagate gradients
+        # to the screen-space points (e.g., if gradients are fully masked out).
+        # Skip stats update in that case.
+        if getattr(viewspace_point_tensor, "grad", None) is None:
+            return
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1

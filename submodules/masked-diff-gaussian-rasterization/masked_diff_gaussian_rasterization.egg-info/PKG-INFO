@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: masked-diff-gaussian-rasterization
+Version: 0.0.3
+Summary: Mask-aware rasterizer built from diff-gaussian-rasterization sources (mask applied in forward/backward)
+Requires-Python: >=3.8
+Dynamic: requires-python
+Dynamic: summary

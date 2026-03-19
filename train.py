@@ -52,7 +52,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians, mask_opt=opt)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -72,6 +72,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    def _filter_views_with_masks(views):
+        if not getattr(opt, "mask_only", False):
+            return views
+        # Keep only views that have required masks on disk.
+        kept = []
+        for v in views:
+            stem = os.path.splitext(os.path.basename(v.image_name))[0]
+            mask_dir = os.path.join(dataset.source_path, dataset.images, opt.mask_dirname, stem)
+            if int(getattr(opt, "mask_object_id", -1)) >= 0:
+                mid = int(opt.mask_object_id)
+                if os.path.exists(os.path.join(mask_dir, f"obj_{mid:04d}.png")):
+                    kept.append(v)
+            else:
+                if os.path.isdir(mask_dir) and len(glob.glob(os.path.join(mask_dir, "*.png"))) > 0:
+                    kept.append(v)
+        if not kept:
+            raise RuntimeError(
+                "mask_only is enabled but no views have masks on disk. "
+                "Run generate_multiview_sam_masks.py first, and ensure --images matches where masks are written."
+            )
+        return kept
+
+    viewpoint_stack = _filter_views_with_masks(viewpoint_stack)
+    viewpoint_indices = list(range(len(viewpoint_stack)))
+
     mask_cache = {}
 
     def _load_object_masks_for_view(viewpoint_cam):
@@ -86,7 +111,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mask_cache[key] = []
             return []
 
-        paths = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
+        if int(getattr(opt, "mask_object_id", -1)) >= 0:
+            mid = int(opt.mask_object_id)
+            paths = [os.path.join(mask_dir, f"obj_{mid:04d}.png")]
+        else:
+            paths = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
         if not paths:
             mask_cache[key] = []
             return []
@@ -95,6 +124,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         masks = []
         H, W = int(viewpoint_cam.image_height), int(viewpoint_cam.image_width)
         for p in paths[: int(opt.mask_max_objects)]:
+            if not os.path.exists(p):
+                continue
             m = Image.open(p).convert("L")
             m = torch.from_numpy(np.array(m, dtype=np.uint8)).float() / 255.0
             if m.shape[0] != H or m.shape[1] != W:
@@ -192,7 +223,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_stack = _filter_views_with_masks(scene.getTrainCameras().copy())
             viewpoint_indices = list(range(len(viewpoint_stack)))
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
@@ -204,8 +235,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        # If mask_only is enabled and we want to use the masked rasterizer, avoid the unmasked render
+        # (it may include verbose CUDA debug prints in some builds, and is unnecessary for gradients).
+        if getattr(opt, "mask_only", False) and opt.mask_use_masked_rasterizer:
+            obj_masks = _load_object_masks_for_view(viewpoint_cam)
+            if not obj_masks:
+                raise RuntimeError(
+                    f"mask_only is enabled but no masks found for view {viewpoint_cam.image_name}. "
+                    f"Expected: <source>/<images>/{opt.mask_dirname}/{os.path.splitext(os.path.basename(viewpoint_cam.image_name))[0]}/obj_*.png"
+                )
+            obj_masks = [m.to(device=bg.device) for m in obj_masks]
+            union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
+            render_pkg = render(
+                viewpoint_cam,
+                gaussians,
+                pipe,
+                bg,
+                use_trained_exp=dataset.train_test_exp,
+                separate_sh=SPARSE_ADAM_AVAILABLE,
+                mask=union_mask,
+                use_masked_rasterizer=True,
+                apply_mask_in_forward=False,
+            )
+        else:
+            render_pkg = render(
+                viewpoint_cam,
+                gaussians,
+                pipe,
+                bg,
+                use_trained_exp=dataset.train_test_exp,
+                separate_sh=SPARSE_ADAM_AVAILABLE,
+            )
+
+        image, viewspace_point_tensor, visibility_filter, radii = (
+            render_pkg["render"],
+            render_pkg["viewspace_points"],
+            render_pkg["visibility_filter"],
+            render_pkg["radii"],
+        )
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -213,60 +280,79 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-
-        # Mask loss (optional): full-image loss + object-mask losses
-        if opt.mask_loss_weight > 0.0:
+        # Optional: object-only training (only optimize pixels inside selected mask)
+        if getattr(opt, "mask_only", False):
+            # When opt.mask_use_masked_rasterizer is enabled, `render_pkg` above already used it.
             obj_masks = _load_object_masks_for_view(viewpoint_cam)
-            if obj_masks:
-                obj_masks = [m.to(device=image.device) for m in obj_masks]
-                union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
+            if not obj_masks:
+                raise RuntimeError(
+                    f"mask_only is enabled but no masks found for view {viewpoint_cam.image_name}. "
+                    f"Expected: <source>/<images>/{opt.mask_dirname}/{os.path.splitext(os.path.basename(viewpoint_cam.image_name))[0]}/obj_*.png"
+                )
+            obj_masks = [m.to(device=image.device) for m in obj_masks]
+            union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
+            mask3 = union_mask.expand_as(image)
 
-                # Per-object masked loss on current rendered image
-                per_obj = 0.0
-                for m in obj_masks:
-                    per_obj = per_obj + _masked_l1(image, gt_image, m)
-                per_obj = per_obj / float(len(obj_masks))
+            Ll1 = _masked_l1(image, gt_image, union_mask)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(
+                    (image * mask3).unsqueeze(0),
+                    (gt_image * mask3).unsqueeze(0),
+                )
+            else:
+                ssim_value = ssim(image * mask3, gt_image * mask3)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        else:
+            Ll1 = l1_loss(image, gt_image)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            else:
+                ssim_value = ssim(image, gt_image)
 
-                # Optional: run a second render path that uses masked rasterizer (mask applied in forward/backward)
-                if opt.mask_use_masked_rasterizer:
-                    # Ensure the module is importable even without pip install
-                    masked_submodule = os.path.join(os.path.dirname(__file__), "submodules", "masked-diff-gaussian-rasterization")
-                    if masked_submodule not in sys.path:
-                        sys.path.insert(0, masked_submodule)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-                    render_pkg_masked = render(
-                        viewpoint_cam,
-                        gaussians,
-                        pipe,
-                        bg,
-                        use_trained_exp=dataset.train_test_exp,
-                        separate_sh=SPARSE_ADAM_AVAILABLE,
-                        mask=union_mask,
-                        use_masked_rasterizer=True,
-                        apply_mask_in_forward=True,
-                    )
-                    image_masked = render_pkg_masked["render"]
-                    union_obj = _masked_l1(image_masked, gt_image, union_mask)
-                else:
-                    union_obj = _masked_l1(image, gt_image, union_mask)
+            # Mask loss (optional): full-image loss + object-mask losses
+            if opt.mask_loss_weight > 0.0:
+                obj_masks = _load_object_masks_for_view(viewpoint_cam)
+                if obj_masks:
+                    obj_masks = [m.to(device=image.device) for m in obj_masks]
+                    union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
 
-                if opt.mask_pack_loss:
-                    packed = _packed_mask_loss(image, gt_image, obj_masks, int(opt.mask_pack_size))
-                else:
-                    packed = None
+                    # Per-object masked loss on current rendered image
+                    per_obj = 0.0
+                    for m in obj_masks:
+                        per_obj = per_obj + _masked_l1(image, gt_image, m)
+                    per_obj = per_obj / float(len(obj_masks))
 
-                if packed is None:
-                    mask_loss = 0.5 * union_obj + 0.5 * per_obj
-                else:
-                    mask_loss = (union_obj + per_obj + packed) / 3.0
-                loss = loss + float(opt.mask_loss_weight) * mask_loss
+                    # Optional: run a second render path that uses masked rasterizer (mask applied in forward/backward)
+                    if opt.mask_use_masked_rasterizer:
+                        render_pkg_masked = render(
+                            viewpoint_cam,
+                            gaussians,
+                            pipe,
+                            bg,
+                            use_trained_exp=dataset.train_test_exp,
+                            separate_sh=SPARSE_ADAM_AVAILABLE,
+                            mask=union_mask,
+                            use_masked_rasterizer=True,
+                            apply_mask_in_forward=True,
+                        )
+                        image_masked = render_pkg_masked["render"]
+                        union_obj = _masked_l1(image_masked, gt_image, union_mask)
+                    else:
+                        union_obj = _masked_l1(image, gt_image, union_mask)
+
+                    if opt.mask_pack_loss:
+                        packed = _packed_mask_loss(image, gt_image, obj_masks, int(opt.mask_pack_size))
+                    else:
+                        packed = None
+
+                    if packed is None:
+                        mask_loss = 0.5 * union_obj + 0.5 * per_obj
+                    else:
+                        mask_loss = (union_obj + per_obj + packed) / 3.0
+                    loss = loss + float(opt.mask_loss_weight) * mask_loss
 
         # Depth regularization
         Ll1depth_pure = 0.0

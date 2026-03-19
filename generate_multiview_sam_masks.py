@@ -1,5 +1,9 @@
 import argparse
 import os
+import glob
+
+import numpy as np
+from PIL import Image
 
 from utils.multiview_sam_mask import (
     SamAutoMaskParams,
@@ -22,6 +26,12 @@ def main():
     parser.add_argument("--min_shared_points", type=int, default=20)
     parser.add_argument("--max_points_per_image", type=int, default=5000)
     parser.add_argument("--max_images", type=int, default=0, help="0 means all")
+    parser.add_argument(
+        "--summary_topk",
+        type=int,
+        default=10,
+        help="After writing masks, print top-K objects by total mask area across views (0 disables)",
+    )
 
     # SAM AutomaticMaskGenerator params
     parser.add_argument("--points_per_side", type=int, default=32)
@@ -53,6 +63,32 @@ def main():
     )
 
     print(f"Masks written to: {out_dir}")
+
+    if int(args.summary_topk) > 0:
+        # Summarize object ids by total area to help choose `--mask_object_id` later.
+        obj_area = {}
+        obj_views = {}
+        for stem_dir in sorted(glob.glob(os.path.join(out_dir, "*"))):
+            if not os.path.isdir(stem_dir):
+                continue
+            stem = os.path.basename(stem_dir)
+            for p in glob.glob(os.path.join(stem_dir, "obj_*.png")):
+                name = os.path.basename(p)
+                try:
+                    obj_id = int(name.split("_")[1].split(".")[0])
+                except Exception:
+                    continue
+                m = np.array(Image.open(p).convert("L"), dtype=np.uint8)
+                area = int((m > 127).sum())
+                obj_area[obj_id] = obj_area.get(obj_id, 0) + area
+                obj_views.setdefault(obj_id, set()).add(stem)
+
+        ranked = sorted(obj_area.items(), key=lambda kv: -kv[1])
+        topk = ranked[: int(args.summary_topk)]
+        if topk:
+            print("\n[Mask Summary] top objects by total area:")
+            for obj_id, area in topk:
+                print(f"  obj_{obj_id:04d}: area={area} views={len(obj_views.get(obj_id, []))}")
 
 
 if __name__ == "__main__":

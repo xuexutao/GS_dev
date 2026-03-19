@@ -11,8 +11,9 @@
 
 import os
 import sys
+import math
 from PIL import Image
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
@@ -22,6 +23,7 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+from utils.read_write_model import read_model as _colmap_read_model
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -141,6 +143,108 @@ def storePly(path, xyz, rgb):
     vertex_element = PlyElement.describe(elements, 'vertex')
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
+
+
+def build_object_pointcloud_from_colmap_masks(
+    source_path: str,
+    images_subdir: str,
+    mask_dirname: str,
+    object_id: int,
+    sparse_subdir: str = os.path.join("sparse", "0"),
+    min_inlier_ratio: float = 0.5,
+    min_inlier_count: int = 1,
+) -> BasicPointCloud:
+    """根据 COLMAP points3D 的 track，将 3D 点投票归属到某个 obj mask，并返回筛选后的点云。
+
+    期望 mask 路径：
+      <source_path>/<images_subdir>/<mask_dirname>/<image_stem>/obj_XXXX.png
+
+    筛选规则：对每个 3D 点，统计其所有观测里落在 mask 内的次数 inside_cnt，
+    若 inside_cnt >= max(min_inlier_count, ceil(valid_cnt * min_inlier_ratio)) 则保留。
+    """
+
+    if object_id < 0:
+        raise ValueError("object_id must be >= 0")
+
+    sparse_dir = os.path.join(source_path, sparse_subdir)
+    cameras, images, points3D = _colmap_read_model(sparse_dir)
+
+    # cache: image_id -> float mask array in [0,1] or None if missing
+    mask_cache = {}
+
+    def _load_mask_for_image(img) -> Optional[np.ndarray]:
+        if img.id in mask_cache:
+            return mask_cache[img.id]
+
+        stem = os.path.splitext(os.path.basename(img.name))[0]
+        mask_path = os.path.join(
+            source_path, images_subdir, mask_dirname, stem, f"obj_{int(object_id):04d}.png"
+        )
+        if not os.path.exists(mask_path):
+            mask_cache[img.id] = None
+            return None
+
+        m = Image.open(mask_path).convert("L")
+        arr = (np.array(m, dtype=np.uint8).astype(np.float32) / 255.0)
+        mask_cache[img.id] = arr
+        return arr
+
+    kept_xyz = []
+    kept_rgb = []
+
+    for _, p in points3D.items():
+        inside_cnt = 0
+        valid_cnt = 0
+
+        # p.image_ids / p.point2D_idxs are aligned
+        for image_id, p2d_idx in zip(p.image_ids, p.point2D_idxs):
+            img = images.get(int(image_id))
+            if img is None:
+                continue
+            if int(p2d_idx) < 0 or int(p2d_idx) >= int(img.xys.shape[0]):
+                continue
+
+            mask = _load_mask_for_image(img)
+            if mask is None:
+                continue
+
+            # Scale COLMAP 2D points (defined in original camera resolution)
+            # into the mask/image resolution on disk.
+            cam = cameras.get(int(img.camera_id))
+            if cam is not None and float(getattr(cam, "width", 0)) > 0 and float(getattr(cam, "height", 0)) > 0:
+                sx = float(mask.shape[1]) / float(cam.width)
+                sy = float(mask.shape[0]) / float(cam.height)
+            else:
+                sx = 1.0
+                sy = 1.0
+
+            x, y = img.xys[int(p2d_idx)]
+            ix = int(round(float(x) * sx))
+            iy = int(round(float(y) * sy))
+            H, W = mask.shape
+            if 0 <= ix < W and 0 <= iy < H:
+                valid_cnt += 1
+                if float(mask[iy, ix]) > 0.5:
+                    inside_cnt += 1
+
+        if valid_cnt <= 0:
+            continue
+
+        required = max(int(min_inlier_count), int(math.ceil(valid_cnt * float(min_inlier_ratio))))
+        if inside_cnt >= required:
+            kept_xyz.append(p.xyz)
+            kept_rgb.append(p.rgb)
+
+    if len(kept_xyz) == 0:
+        raise RuntimeError(
+            f"No COLMAP points3D matched obj_{int(object_id):04d}.png masks. "
+            f"Check masks exist under <source>/<images>/{mask_dirname}/<stem>/obj_XXXX.png and object_id is correct."
+        )
+
+    xyz = np.asarray(kept_xyz, dtype=np.float32)
+    rgb = np.asarray(kept_rgb, dtype=np.float32) / 255.0
+    normals = np.zeros_like(xyz, dtype=np.float32)
+    return BasicPointCloud(points=xyz, colors=rgb, normals=normals)
 
 def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     try:

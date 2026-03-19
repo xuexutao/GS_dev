@@ -1,0 +1,11 @@
+setup.py
+/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/masked-diff-gaussian-rasterization/../diff-gaussian-rasterization/ext.cpp
+/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/masked-diff-gaussian-rasterization/../diff-gaussian-rasterization/rasterize_points.cu
+/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/masked-diff-gaussian-rasterization/../diff-gaussian-rasterization/cuda_rasterizer/backward.cu
+/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/masked-diff-gaussian-rasterization/../diff-gaussian-rasterization/cuda_rasterizer/forward.cu
+/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/masked-diff-gaussian-rasterization/../diff-gaussian-rasterization/cuda_rasterizer/rasterizer_impl.cu
+masked_diff_gaussian_rasterization/__init__.py
+masked_diff_gaussian_rasterization.egg-info/PKG-INFO
+masked_diff_gaussian_rasterization.egg-info/SOURCES.txt
+masked_diff_gaussian_rasterization.egg-info/dependency_links.txt
+masked_diff_gaussian_rasterization.egg-info/top_level.txt

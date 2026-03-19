@@ -106,9 +106,18 @@ class OptimizationParams(ParamGroup):
         self.mask_dirname = "masks_sam"  # under <source_path>/<images>/
         self.mask_max_objects = 16
         self.mask_min_coverage = 0.001  # ignore tiny masks (ratio of pixels)
+        # If >=0, only use obj_XXXX.png with this id (XXXX = mask_object_id).
+        # Useful for object-only reconstruction.
+        self.mask_object_id = -1
+        # If set, train only on the selected mask (no full-image loss).
+        self.mask_only = False
         self.mask_use_masked_rasterizer = False
         self.mask_pack_loss = False
         self.mask_pack_size = 512
+        # When mask_only is enabled, optionally filter COLMAP points3D to initialize Gaussians
+        # from the selected object only.
+        self.mask_points3d_min_ratio = 0.5
+        self.mask_points3d_min_count = 1
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

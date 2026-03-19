@@ -140,6 +140,8 @@ def _point_to_mask_index(
     width: int,
     height: int,
     max_points: Optional[int] = None,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
 ) -> Dict[int, int]:
     """Assign each COLMAP point3D id (observed in this image) to a SAM mask index.
 
@@ -154,23 +156,27 @@ def _point_to_mask_index(
         xys = xys[idx]
         pids = pids[idx]
 
-    # Pre-pack segmentations
-    segs = [m["segmentation"] for m in masks]
+    # Pre-pack segmentations.
+    # Important: when assigning COLMAP keypoints to a SAM mask, prefer *smaller* masks first.
+    # Otherwise large masks (often near-full-image) would absorb many points and break multi-view object linking.
+    order = list(range(len(masks)))
+    order.sort(key=lambda mi: int(masks[mi].get("area", 0)))
+    segs = [masks[mi]["segmentation"] for mi in order]
     out: Dict[int, int] = {}
 
     for (xy, pid) in zip(xys, pids):
         if pid == -1:
             continue
-        x = int(round(float(xy[0])))
-        y = int(round(float(xy[1])))
+        x = int(round(float(xy[0]) * float(scale_x)))
+        y = int(round(float(xy[1]) * float(scale_y)))
         if x < 0 or y < 0 or x >= width or y >= height:
             continue
         # Find first mask containing this pixel
         assigned = -1
-        for mi, seg in enumerate(segs):
+        for local_i, seg in enumerate(segs):
             # seg is HxW bool
             if seg[y, x]:
-                assigned = mi
+                assigned = order[local_i]
                 break
         if assigned != -1:
             out[int(pid)] = assigned
@@ -221,9 +227,10 @@ def generate_multiview_consistent_masks(
     node_ids: Dict[Tuple[int, int], int] = {}  # (image_id, mask_idx) -> node id
     node_list: List[Tuple[int, int]] = []
 
-    for image_id, im in image_items:
+    total_images = len(image_items)
+    for ii, (image_id, im) in enumerate(image_items):
         cam = cameras[im.camera_id]
-        width, height = int(cam.width), int(cam.height)
+        orig_w, orig_h = int(cam.width), int(cam.height)
         image_path = os.path.join(source_path, images_subdir, im.name)
         if not os.path.exists(image_path):
             # Some datasets pass images_subdir as absolute; keep behavior explicit.
@@ -231,18 +238,34 @@ def generate_multiview_consistent_masks(
 
         if dry_run:
             # Minimal placeholder for CPU-only sanity checks.
+            rgb = _load_image_rgb(image_path)
+            height, width = int(rgb.shape[0]), int(rgb.shape[1])
             masks = [{"segmentation": np.ones((height, width), dtype=bool), "area": height * width, "bbox": [0, 0, width, height]}]
         else:
             rgb = _load_image_rgb(image_path)
+            height, width = int(rgb.shape[0]), int(rgb.shape[1])
             masks = sam_automatic_masks(rgb, sam, sam_params)
         per_image_masks[image_id] = masks
 
-        pid2m = _point_to_mask_index(im, masks, width=width, height=height, max_points=max_points_per_image)
+        scale_x = float(width) / float(orig_w) if orig_w > 0 else 1.0
+        scale_y = float(height) / float(orig_h) if orig_h > 0 else 1.0
+        pid2m = _point_to_mask_index(
+            im,
+            masks,
+            width=width,
+            height=height,
+            max_points=max_points_per_image,
+            scale_x=scale_x,
+            scale_y=scale_y,
+        )
         per_image_pid_to_mask[image_id] = pid2m
 
         for mi in range(len(masks)):
             node_ids[(image_id, mi)] = len(node_list)
             node_list.append((image_id, mi))
+
+        if (ii + 1) % 10 == 0 or (ii + 1) == total_images:
+            print(f"[SAM] processed {ii + 1}/{total_images}: {im.name} (masks={len(masks)})")
 
     # 2) Accumulate segment co-visibility edges via COLMAP tracks
     pair_counts: Dict[Tuple[int, int], int] = {}

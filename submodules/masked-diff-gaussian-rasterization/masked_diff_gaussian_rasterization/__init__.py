@@ -5,8 +5,8 @@ import torch.nn as nn
 
 
 try:
-    # Reuse the compiled C++/CUDA extension from the original rasterizer.
-    from diff_gaussian_rasterization import _C  # type: ignore
+    # Build/ship our own extension module (compiled from upstream sources).
+    from . import _C  # type: ignore
 except Exception as e:  # pragma: no cover
     _C = None
     _IMPORT_ERROR = e
@@ -55,7 +55,7 @@ class _RasterizeGaussiansMasked(torch.autograd.Function):
     ):
         if _C is None:  # pragma: no cover
             raise ImportError(
-                "diff_gaussian_rasterization is not available; cannot use masked rasterizer"
+                "masked_diff_gaussian_rasterization extension is not available; please reinstall this package"
             ) from _IMPORT_ERROR
 
         args = (
@@ -113,7 +113,7 @@ class _RasterizeGaussiansMasked(torch.autograd.Function):
     def backward(ctx, grad_out_color, _, grad_out_depth):
         if _C is None:  # pragma: no cover
             raise ImportError(
-                "diff_gaussian_rasterization is not available; cannot use masked rasterizer"
+                "masked_diff_gaussian_rasterization extension is not available; please reinstall this package"
             ) from _IMPORT_ERROR
 
         raster_settings = ctx.raster_settings
@@ -211,6 +211,10 @@ class GaussianRasterizer(nn.Module):
         self.raster_settings = raster_settings
 
     def markVisible(self, positions):
+        if _C is None:  # pragma: no cover
+            raise ImportError(
+                "masked_diff_gaussian_rasterization extension is not available; please reinstall this package"
+            ) from _IMPORT_ERROR
         with torch.no_grad():
             raster_settings = self.raster_settings
             return _C.mark_visible(positions, raster_settings.viewmatrix, raster_settings.projmatrix)
@@ -264,4 +268,3 @@ class GaussianRasterizer(nn.Module):
             mask=mask,
             apply_mask_in_forward=apply_mask_in_forward,
         )
-

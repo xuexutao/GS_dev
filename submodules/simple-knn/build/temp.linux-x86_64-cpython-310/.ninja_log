@@ -1,7 +1,7 @@
-# ninja log v5
-9	17223	1769274029337683000	/mnt/bn/isp-traindata-lf-2/xxt/workspace/new_demo/gaussian-splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/ext.o	297ff203cbce88e7
-10	22911	1769274035025825000	/mnt/bn/isp-traindata-lf-2/xxt/workspace/new_demo/gaussian-splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/simple_knn.o	2dcda86e32c0af82
-10	51851	1769274063968126000	/mnt/bn/isp-traindata-lf-2/xxt/workspace/new_demo/gaussian-splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/spatial.o	f73927f9ce3362b1
-35	23102	1772950756437215000	/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/ext.o	3d33331bbe94a709
-35	64553	1772950797899651000	/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/simple_knn.o	60c5cc91bd442234
-35	72020	1772950805363863000	/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/spatial.o	fa79e3bfe5c25685
+# ninja log v7
+108	23537	1773849200890224314	/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/ext.o	d3128266458fa8e1
+130	55949	1773849200890224314	/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/simple_knn.o	ff20d9fb37a9f890
+139	85490	1773849200890224314	/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/spatial.o	1ecff73a6b8c6fd2
+8550	35667	1773850116367963000	/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/ext.o	aa2f8b94012bdc9f
+8550	63161	1773850143865565000	/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/simple_knn.o	ea4dedde0b812297
+8551	88150	1773850168865228000	/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/spatial.o	2055560b404ea5bf
