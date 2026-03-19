@@ -1,5 +1,6 @@
 output/*
+__pycache__
 **/__pycache__
 **build/
 **/*.pth
-.vene
+.venv/
