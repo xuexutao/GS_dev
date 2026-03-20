@@ -62,17 +62,10 @@ def render(
         antialiasing=pipe.antialiasing
     )
 
+    # Mask-aware rasterization is implemented inside our diff_gaussian_rasterization build.
+    # Keep the flag for backward compatibility with existing training scripts.
     use_masked = use_masked_rasterizer and mask is not None
-    if use_masked:
-        try:
-            from masked_diff_gaussian_rasterization import GaussianRasterizer as MaskedGaussianRasterizer
-        except Exception as e:
-            raise ImportError(
-                "masked_diff_gaussian_rasterization not found. Install submodules/masked-diff-gaussian-rasterization."
-            ) from e
-        rasterizer = MaskedGaussianRasterizer(raster_settings=raster_settings)
-    else:
-        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     means3D = pc.get_xyz
     means2D = screenspace_points
@@ -111,6 +104,8 @@ def render(
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     if separate_sh:
+        # Note: dc/shs split is only supported by some rasterizer builds.
+        # Keep current behavior but allow optional masking.
         if use_masked:
             rendered_image, radii, depth_image = rasterizer(
                 means3D=means3D,

@@ -256,6 +256,57 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
+    def save_ply_masked(self, path, mask):
+        """保存高斯点云子集到 ply。
+
+        参数:
+          - mask: (N,) bool Tensor / (K,) long Tensor / list[int]
+        """
+        if mask is None:
+            return
+
+        if isinstance(mask, torch.Tensor):
+            if mask.dtype == torch.bool:
+                idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
+            else:
+                idx = mask.long().view(-1)
+        else:
+            idx = torch.as_tensor(mask, dtype=torch.long)
+
+        if idx.numel() == 0:
+            return
+
+        mkdir_p(os.path.dirname(path))
+
+        xyz = self._xyz.detach()[idx].cpu().numpy()
+        normals = np.zeros_like(xyz)
+        f_dc = (
+            self._features_dc.detach()[idx]
+            .transpose(1, 2)
+            .flatten(start_dim=1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        f_rest = (
+            self._features_rest.detach()[idx]
+            .transpose(1, 2)
+            .flatten(start_dim=1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        opacities = self._opacity.detach()[idx].cpu().numpy()
+        scale = self._scaling.detach()[idx].cpu().numpy()
+        rotation = self._rotation.detach()[idx].cpu().numpy()
+
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(path)
+
     def reset_opacity(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")

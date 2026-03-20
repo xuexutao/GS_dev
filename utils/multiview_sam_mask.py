@@ -264,7 +264,8 @@ def generate_multiview_consistent_masks(
             node_ids[(image_id, mi)] = len(node_list)
             node_list.append((image_id, mi))
 
-        if (ii + 1) % 10 == 0 or (ii + 1) == total_images:
+        # Print frequently to keep long runs observable (and avoid job watchdog timeouts).
+        if (ii + 1) % 1 == 0 or (ii + 1) == total_images:
             print(f"[SAM] processed {ii + 1}/{total_images}: {im.name} (masks={len(masks)})")
 
     # 2) Accumulate segment co-visibility edges via COLMAP tracks
