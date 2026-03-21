@@ -94,7 +94,10 @@ def main():
         device=args.device,
         sam_params=sam_params,
         min_shared_points=args.min_shared_points,
+        min_shared_ratio=args.min_shared_ratio,
         max_points_per_image=(args.max_points_per_image if args.max_points_per_image > 0 else None),
+        max_masks_per_point=args.max_masks_per_point,
+        min_mask_area_for_linking=args.min_mask_area_for_linking,
         max_images=(args.max_images if args.max_images and args.max_images > 0 else None),
         dry_run=args.dry_run
     )

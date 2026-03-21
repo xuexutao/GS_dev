@@ -183,6 +183,73 @@ def _point_to_mask_index(
     return out
 
 
+def _point_to_mask_indices(
+    image_entry,
+    masks: List[dict],
+    width: int,
+    height: int,
+    max_points: Optional[int] = None,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    max_masks_per_point: int = 1,
+    min_mask_area_for_linking: int = 0,
+) -> Dict[int, List[int]]:
+    """Assign each COLMAP point3D id (observed in this image) to up to K SAM mask indices.
+
+    When a 2D keypoint lies in multiple nested SAM masks, allowing it to vote for a few
+    *small* masks (instead of a single one) typically improves multi-view linkage stability.
+    """
+
+    if int(max_masks_per_point) <= 1:
+        single = _point_to_mask_index(
+            image_entry,
+            masks=masks,
+            width=width,
+            height=height,
+            max_points=max_points,
+            scale_x=scale_x,
+            scale_y=scale_y,
+        )
+        return {pid: [mi] for pid, mi in single.items()}
+
+    xys = image_entry.xys
+    pids = image_entry.point3D_ids
+    if max_points is not None and xys.shape[0] > max_points:
+        idx = np.linspace(0, xys.shape[0] - 1, max_points).astype(np.int64)
+        xys = xys[idx]
+        pids = pids[idx]
+
+    # Prefer smaller masks first.
+    order = list(range(len(masks)))
+    order.sort(key=lambda mi: int(masks[mi].get("area", 0)))
+
+    segs: List[Tuple[int, np.ndarray]] = []
+    for mi in order:
+        area = int(masks[mi].get("area", 0))
+        if int(min_mask_area_for_linking) > 0 and area < int(min_mask_area_for_linking):
+            continue
+        segs.append((int(mi), masks[mi]["segmentation"]))
+
+    out: Dict[int, List[int]] = {}
+    for (xy, pid) in zip(xys, pids):
+        if pid == -1:
+            continue
+        x = int(round(float(xy[0]) * float(scale_x)))
+        y = int(round(float(xy[1]) * float(scale_y)))
+        if x < 0 or y < 0 or x >= width or y >= height:
+            continue
+
+        chosen: List[int] = []
+        for mi, seg in segs:
+            if seg[y, x]:
+                chosen.append(int(mi))
+                if len(chosen) >= int(max_masks_per_point):
+                    break
+        if chosen:
+            out[int(pid)] = chosen
+    return out
+
+
 def generate_multiview_consistent_masks(
     source_path: str,
     images_subdir: str = "images",
@@ -193,7 +260,10 @@ def generate_multiview_consistent_masks(
     device: str = "cuda",
     sam_params: Optional[SamAutoMaskParams] = None,
     min_shared_points: int = 20,
+    min_shared_ratio: float = 0.0,
     max_points_per_image: Optional[int] = 5000,
+    max_masks_per_point: int = 1,
+    min_mask_area_for_linking: int = 0,
     max_images: Optional[int] = None,
     dry_run: bool = False,
 ) -> str:
@@ -223,7 +293,7 @@ def generate_multiview_consistent_masks(
 
     # 1) Run SAM on each image
     per_image_masks: Dict[int, List[dict]] = {}
-    per_image_pid_to_mask: Dict[int, Dict[int, int]] = {}
+    per_image_pid_to_masks: Dict[int, Dict[int, List[int]]] = {}
     node_ids: Dict[Tuple[int, int], int] = {}  # (image_id, mask_idx) -> node id
     node_list: List[Tuple[int, int]] = []
 
@@ -249,7 +319,7 @@ def generate_multiview_consistent_masks(
 
         scale_x = float(width) / float(orig_w) if orig_w > 0 else 1.0
         scale_y = float(height) / float(orig_h) if orig_h > 0 else 1.0
-        pid2m = _point_to_mask_index(
+        pid2ms = _point_to_mask_indices(
             im,
             masks,
             width=width,
@@ -257,8 +327,10 @@ def generate_multiview_consistent_masks(
             max_points=max_points_per_image,
             scale_x=scale_x,
             scale_y=scale_y,
+            max_masks_per_point=int(max_masks_per_point),
+            min_mask_area_for_linking=int(min_mask_area_for_linking),
         )
-        per_image_pid_to_mask[image_id] = pid2m
+        per_image_pid_to_masks[image_id] = pid2ms
 
         for mi in range(len(masks)):
             node_ids[(image_id, mi)] = len(node_list)
@@ -271,20 +343,31 @@ def generate_multiview_consistent_masks(
     # 2) Accumulate segment co-visibility edges via COLMAP tracks
     pair_counts: Dict[Tuple[int, int], int] = {}
 
+    # Node degree proxy: number of 3D points that vote for each node (image,mask).
+    # Used by min_shared_ratio to avoid linking huge nodes via a tiny overlap.
+    node_point_counts: List[int] = [0] * len(node_list)
+    for img_id, pid2ms in per_image_pid_to_masks.items():
+        for _, mis in pid2ms.items():
+            for mi in mis:
+                nid = node_ids.get((int(img_id), int(mi)))
+                if nid is not None:
+                    node_point_counts[nid] += 1
+
     for pid, p3d in points3D.items():
         # Collect observed segment nodes for this 3D point
         obs_nodes: List[int] = []
         for img_id in p3d.image_ids:
             img_id = int(img_id)
-            if img_id not in per_image_pid_to_mask:
+            if img_id not in per_image_pid_to_masks:
                 continue
-            mi = per_image_pid_to_mask[img_id].get(int(pid), -1)
-            if mi == -1:
+            mis = per_image_pid_to_masks[img_id].get(int(pid), [])
+            if not mis:
                 continue
-            n = node_ids.get((img_id, mi), None)
-            if n is None:
-                continue
-            obs_nodes.append(n)
+            for mi in mis:
+                n = node_ids.get((img_id, int(mi)), None)
+                if n is None:
+                    continue
+                obs_nodes.append(n)
 
         if len(obs_nodes) < 2:
             continue
@@ -300,7 +383,17 @@ def generate_multiview_consistent_masks(
 
     # 3) Union segments into multiview objects
     uf = UnionFind(len(node_list))
-    edges = [(cnt, a, b) for (a, b), cnt in pair_counts.items() if cnt >= int(min_shared_points)]
+    edges = []
+    for (a, b), cnt in pair_counts.items():
+        if cnt < int(min_shared_points):
+            continue
+        if float(min_shared_ratio) > 0.0:
+            denom = min(int(node_point_counts[a]), int(node_point_counts[b]))
+            if denom <= 0:
+                continue
+            if (float(cnt) / float(denom)) < float(min_shared_ratio):
+                continue
+        edges.append((cnt, a, b))
     edges.sort(key=lambda t: -t[0])
     for cnt, a, b in edges:
         uf.union(a, b)
@@ -313,6 +406,36 @@ def generate_multiview_consistent_masks(
         if r not in root_to_obj:
             root_to_obj[r] = len(root_to_obj)
         node_to_obj[nid] = root_to_obj[r]
+
+    # Quick consistency report: how often a COLMAP points3D votes into a single object id.
+    # This is not a proof, but a useful sanity metric to detect weak multi-view linkage.
+    total_pts = 0
+    consistent_pts = 0
+    ambiguous_pts = 0
+    for pid, p3d in points3D.items():
+        obj_ids = set()
+        for img_id in p3d.image_ids:
+            img_id = int(img_id)
+            if img_id not in per_image_pid_to_masks:
+                continue
+            for mi in per_image_pid_to_masks[img_id].get(int(pid), []):
+                nid = node_ids.get((img_id, int(mi)))
+                if nid is None:
+                    continue
+                obj_ids.add(int(node_to_obj[nid]))
+        if not obj_ids:
+            continue
+        total_pts += 1
+        if len(obj_ids) == 1:
+            consistent_pts += 1
+        else:
+            ambiguous_pts += 1
+    if total_pts > 0:
+        frac = 100.0 * float(consistent_pts) / float(total_pts)
+        print(
+            f"[Consistency] points3D single-object={consistent_pts}/{total_pts} ({frac:.2f}%), "
+            f"multi-object={ambiguous_pts}/{total_pts}"
+        )
 
     # 5) Write masks per image and object
     out_dir = os.path.join(source_path, out_subdir)
