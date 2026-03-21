@@ -24,7 +24,25 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dry_run", action="store_true", help="Do not load SAM; write a single full-image mask per view for sanity check")
     parser.add_argument("--min_shared_points", type=int, default=20)
+    parser.add_argument(
+        "--min_shared_ratio",
+        type=float,
+        default=0.05,
+        help="Additional linking criterion: shared_points / min(node_points) >= ratio. Set 0 to disable.",
+    )
     parser.add_argument("--max_points_per_image", type=int, default=5000)
+    parser.add_argument(
+        "--max_masks_per_point",
+        type=int,
+        default=2,
+        help="For each COLMAP keypoint, allow it to vote for up to K smallest SAM masks that contain it.",
+    )
+    parser.add_argument(
+        "--min_mask_area_for_linking",
+        type=int,
+        default=256,
+        help="Ignore SAM masks smaller than this area when building multi-view linking edges.",
+    )
     parser.add_argument("--max_images", type=int, default=0, help="0 means all")
     parser.add_argument(
         "--summary_topk",
@@ -38,6 +56,25 @@ def main():
     parser.add_argument("--pred_iou_thresh", type=float, default=0.86)
     parser.add_argument("--stability_score_thresh", type=float, default=0.92)
     parser.add_argument("--min_mask_region_area", type=int, default=256)
+
+    # Optional: export points3D segmented by global object_id
+    parser.add_argument(
+        "--export_points3d",
+        action="store_true",
+        help="Write a labeled points3D PLY (with object_id) into the output dir",
+    )
+    parser.add_argument(
+        "--export_points3d_per_object",
+        action="store_true",
+        help="Additionally write one PLY per object to <out_dir>/points3D_instances/",
+    )
+    parser.add_argument(
+        "--min_points_per_object",
+        type=int,
+        default=200,
+        help="Min points to export an object PLY when --export_points3d_per_object",
+    )
+    parser.add_argument("--points3d_labeled_name", default="points3D_labeled.ply")
 
     args = parser.parse_args()
     sam_params = SamAutoMaskParams(
@@ -57,9 +94,17 @@ def main():
         device=args.device,
         sam_params=sam_params,
         min_shared_points=args.min_shared_points,
+        min_shared_ratio=args.min_shared_ratio,
         max_points_per_image=(args.max_points_per_image if args.max_points_per_image > 0 else None),
         max_images=(args.max_images if args.max_images and args.max_images > 0 else None),
+        max_masks_per_point=args.max_masks_per_point,
+        min_mask_area_for_linking=args.min_mask_area_for_linking,
         dry_run=args.dry_run,
+
+        export_points3D=bool(args.export_points3d),
+        export_points3D_per_object=bool(args.export_points3d_per_object),
+        min_points_per_object=int(args.min_points_per_object),
+        points3D_labeled_name=str(args.points3d_labeled_name),
     )
 
     print(f"Masks written to: {out_dir}")
