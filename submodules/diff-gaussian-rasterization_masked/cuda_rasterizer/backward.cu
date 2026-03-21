@@ -468,7 +468,8 @@ renderCUDA(
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_dinvdepths
+	float* __restrict__ dL_dinvdepths,
+	const float* __restrict__ mask
 )
 {
 	// We rasterize again. Compute necessary block info.
@@ -486,6 +487,11 @@ renderCUDA(
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
 	bool done = !inside;
+	if (inside && mask != nullptr) {
+		if (mask[pix_id] < 0.5f) {
+			done = true;
+		}
+	}
 	int toDo = range.y - range.x;
 
 	__shared__ int collected_id[BLOCK_SIZE];
@@ -729,7 +735,8 @@ void BACKWARD::render(
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_dinvdepths)
+	float* dL_dinvdepths,
+	const float* mask)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -748,6 +755,7 @@ void BACKWARD::render(
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors,
-		dL_dinvdepths
+		dL_dinvdepths,
+		mask
 		);
 }

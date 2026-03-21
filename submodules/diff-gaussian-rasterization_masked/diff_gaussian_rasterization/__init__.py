@@ -101,7 +101,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.campos,
             raster_settings.prefiltered,
             raster_settings.antialiasing,
-            raster_settings.debug
+            raster_settings.debug,
+            mask.contiguous() if mask is not None else torch.empty(0, dtype=torch.float32, device="cuda")
         )
 
         # Invoke C++/CUDA rasterizer
@@ -161,7 +162,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 binningBuffer,
                 imgBuffer,
                 raster_settings.antialiasing,
-                raster_settings.debug)
+                raster_settings.debug,
+                ctx.mask.contiguous() if getattr(ctx, "mask", None) is not None else torch.empty(0, dtype=torch.float32, device="cuda"))
 
         # Compute gradients for relevant tensors by invoking backward method
         grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)        
