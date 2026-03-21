@@ -94,17 +94,9 @@ def main():
         device=args.device,
         sam_params=sam_params,
         min_shared_points=args.min_shared_points,
-        min_shared_ratio=args.min_shared_ratio,
         max_points_per_image=(args.max_points_per_image if args.max_points_per_image > 0 else None),
         max_images=(args.max_images if args.max_images and args.max_images > 0 else None),
-        max_masks_per_point=args.max_masks_per_point,
-        min_mask_area_for_linking=args.min_mask_area_for_linking,
-        dry_run=args.dry_run,
-
-        export_points3D=bool(args.export_points3d),
-        export_points3D_per_object=bool(args.export_points3d_per_object),
-        min_points_per_object=int(args.min_points_per_object),
-        points3D_labeled_name=str(args.points3d_labeled_name),
+        dry_run=args.dry_run
     )
 
     print(f"Masks written to: {out_dir}")
