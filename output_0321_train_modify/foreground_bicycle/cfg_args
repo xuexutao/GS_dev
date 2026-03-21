@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/data/gs_data/bicycle', model_path='output_0321_train_modify/foreground_bicycle', images='images', depths='', resolution=8, white_background=False, train_test_exp=False, data_device='cuda', eval=False, start_type='train')
