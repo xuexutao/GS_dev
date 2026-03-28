@@ -9,6 +9,15 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+import sys
+
+# Ensure we prefer the repo's CUDA extensions (avoid picking mismatched pip wheels).
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_LOCAL_RASTERIZER = os.path.join(_REPO_ROOT, "submodules", "diff-gaussian-rasterization_masked")
+if os.path.isdir(_LOCAL_RASTERIZER) and _LOCAL_RASTERIZER not in sys.path:
+    sys.path.insert(0, _LOCAL_RASTERIZER)
+
 import torch
 import math
 from typing import Optional
@@ -89,7 +98,7 @@ def render(
     colors_precomp = None
     if override_color is None:
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            shs_view = pc.get_features.transpose(1, 2).contiguous().view(-1, 3, (pc.max_sh_degree+1)**2)
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
@@ -169,7 +178,8 @@ def render(
     out = {
         "render": rendered_image,
         "viewspace_points": screenspace_points,
-        "visibility_filter" : (radii > 0).nonzero(),
+        # Boolean visibility mask. Downstream densify/prune logic expects a bool mask.
+        "visibility_filter" : (radii > 0),
         "radii": radii,
         "depth" : depth_image
         }

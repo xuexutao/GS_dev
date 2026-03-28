@@ -16,6 +16,7 @@
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
 
+// CudaRasterizer 命名空间
 namespace CudaRasterizer
 {
 	template <typename T>
@@ -24,24 +25,24 @@ namespace CudaRasterizer
 		std::size_t offset = (reinterpret_cast<std::uintptr_t>(chunk) + alignment - 1) & ~(alignment - 1);
 		ptr = reinterpret_cast<T*>(offset);
 		chunk = reinterpret_cast<char*>(ptr + count);
-	}
+	} // 从内存块中获取对齐的内存指针
 
 	struct GeometryState
 	{
-		size_t scan_size;
-		float* depths;
-		char* scanning_space;
-		bool* clamped;
-		int* internal_radii;
-		float2* means2D;
-		float* cov3D;
-		float4* conic_opacity;
-		float* rgb;
-		uint32_t* point_offsets;
-		uint32_t* tiles_touched;
+		size_t scan_size;  			// 扫描大小
+		float* depths;     			// 深度值数组
+		char* scanning_space; 		// 扫描空间
+		bool* clamped;        		// 标记是否裁剪数组
+		int* internal_radii;  		// 内部半径数组
+		float2* means2D;     		// 2D 均值数组
+		float* cov3D;         		// 3D协方差数组
+		float4* conic_opacity; 		// 锥形透明度数组
+		float* rgb;           		// RGB值数组
+		uint32_t* point_offsets; 	// 点偏移数组
+		uint32_t* tiles_touched; 	// 触摸的瓦片数组
 
-		static GeometryState fromChunk(char*& chunk, size_t P);
-	};
+		static GeometryState fromChunk(char*& chunk, size_t P); // 静态方法，从内存块创建GeometryState实例
+	}; // 几何状态结构体
 
 	struct ImageState
 	{

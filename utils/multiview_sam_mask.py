@@ -2,6 +2,7 @@ import os
 import itertools
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+from tqdm import tqdm
 
 import numpy as np
 from PIL import Image
@@ -298,7 +299,7 @@ def generate_multiview_consistent_masks(
     node_list: List[Tuple[int, int]] = []
 
     total_images = len(image_items)
-    for ii, (image_id, im) in enumerate(image_items):
+    for ii, (image_id, im) in tqdm(enumerate(list(image_items)), total=total_images):
         cam = cameras[im.camera_id]
         orig_w, orig_h = int(cam.width), int(cam.height)
         image_path = os.path.join(source_path, images_subdir, im.name)

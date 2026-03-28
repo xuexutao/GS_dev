@@ -173,6 +173,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
+	const float* tile_mask,
 	bool prefiltered,
 	bool antialiasing)
 {
@@ -233,7 +234,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		return;
 	float det_inv = 1.f / det;
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv }; // 高斯球的2D空间的协方差矩阵的逆
-	// (debug printf removed)
 
 	// Compute extent in screen space (by finding eigenvalues of
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
@@ -270,7 +270,24 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacity * h_convolution_scaling };
 
 
-	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	if (tile_mask == nullptr)
+	{
+		tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	}
+	else
+	{
+		uint32_t cnt = 0;
+		for (int y = rect_min.y; y < rect_max.y; y++)
+		{
+			uint32_t row = (uint32_t)(y * grid.x);
+			for (int x = rect_min.x; x < rect_max.x; x++)
+			{
+				if (tile_mask[row + (uint32_t)x] > 0.5f)
+					cnt++;
+			}
+		}
+		tiles_touched[idx] = cnt;
+	}
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -463,6 +480,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
+	const float* tile_mask,
 	bool prefiltered,
 	bool antialiasing)
 {
@@ -491,6 +509,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		conic_opacity,
 		grid,
 		tiles_touched,
+		tile_mask,
 		prefiltered,
 		antialiasing
 		);

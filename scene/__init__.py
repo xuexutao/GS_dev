@@ -25,6 +25,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from tqdm import tqdm
 
 class Scene:
 
@@ -130,7 +131,7 @@ class Scene:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"), args.train_test_exp)
+                                                           "point_cloud.ply"), args.train_test_exp, device=args.data_device)
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 
@@ -289,3 +290,215 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+    
+    def assign_semantic_labels(self, semantic_labels: Dict, category_to_id: Dict[str, int] = None):
+        """为高斯点云分配语义标签。
+        
+        参数:
+            semantic_labels: 从对象ID到类别信息的映射，格式为 {obj_id: {"category": "chair", "confidence": 0.9}}
+            category_to_id: 从类别名称到整数ID的映射。如果为None，则自动创建。
+        """
+        print(f"[DEBUG assign_semantic_labels] Called with {len(semantic_labels) if semantic_labels else 0} labels")
+        print(f"[DEBUG] self._mask_opt: {self._mask_opt}")
+        if self._mask_opt is not None:
+            print(f"[DEBUG] mask_opt attributes: {dir(self._mask_opt)}")
+            for attr in ['mask_dir', 'mask_dirname']:
+                if hasattr(self._mask_opt, attr):
+                    print(f"[DEBUG] mask_opt.{attr} = {getattr(self._mask_opt, attr)}")
+        print(f"[DEBUG] self._source_path: {self._source_path}")
+        print(f"[DEBUG] self._images_subdir: {self._images_subdir}")
+        
+        if semantic_labels is None or len(semantic_labels) == 0:
+            print("Warning: No semantic labels provided")
+            return
+        
+        if self._mask_opt is None:
+            print("Warning: Cannot assign semantic labels without mask options")
+            print("[DEBUG] Returning early because self._mask_opt is None")
+            return
+        
+        if not self._source_path:
+            print("Warning: Cannot assign semantic labels without source path")
+            print("[DEBUG] Returning early because self._source_path is empty")
+            return
+        
+        print(f"Assigning semantic labels to {len(semantic_labels)} objects...")
+        
+        # 创建类别到ID的映射
+        if category_to_id is None:
+            # 收集所有唯一的类别
+            categories = set()
+            for obj_info in semantic_labels.values():
+                categories.add(obj_info["category"])
+            categories = sorted(list(categories))
+            category_to_id = {cat: i for i, cat in enumerate(categories)}
+            print(f"Created category mapping: {category_to_id}")
+        
+        # 获取所有对象ID
+        obj_ids = []
+        for obj_id_str in semantic_labels.keys():
+            try:
+                obj_id = int(obj_id_str)
+                obj_ids.append(obj_id)
+            except ValueError:
+                print(f"Warning: Invalid object ID format: {obj_id_str}")
+                continue
+        
+        if not obj_ids:
+            print("Warning: No valid object IDs found")
+            return
+        
+        # 限制对象数量以加速调试
+        obj_ids = obj_ids[:50]
+        print(f"[DEBUG] Limiting to {len(obj_ids)} object IDs for semantic labeling")
+        
+        # 优先使用 mask_opt 中的 mask_dir（完整路径）
+        mask_root = None
+        if hasattr(self._mask_opt, 'mask_dir') and self._mask_opt.mask_dir:
+            mask_root = str(self._mask_opt.mask_dir)
+            print(f"Using mask directory from mask_opt.mask_dir: {mask_root}")
+        else:
+            mask_dirname = str(getattr(self._mask_opt, "mask_dirname", "masks_sam"))
+            mask_root = os.path.join(self._source_path, self._images_subdir, mask_dirname)
+            print(f"Constructed mask directory: {mask_root}")
+        
+        print(f"[DEBUG] Checking mask directory existence: {mask_root}")
+        print(f"[DEBUG] Absolute path: {os.path.abspath(mask_root) if mask_root else None}")
+        if not os.path.isdir(mask_root):
+            print(f"Warning: Mask directory not found: {mask_root}")
+            print(f"  Absolute path: {os.path.abspath(mask_root) if mask_root else None}")
+            print(f"  Source path: {self._source_path}")
+            print(f"  Images subdir: {self._images_subdir}")
+            print(f"  Mask opt attributes: {dir(self._mask_opt)}")
+            return
+        print(f"[DEBUG] Mask directory found, proceeding with voting...")
+        
+        # 使用与 _export_object_gaussians 类似的投票逻辑
+        cams = self.getTrainCameras()
+        if not cams:
+            print("Warning: No training cameras available")
+            return
+        
+        # 选择包含每个对象掩码的视图进行投票
+        cam_by_stem = {}
+        for cam in cams:
+            stem = os.path.splitext(os.path.basename(cam.image_name))[0]
+            cam_by_stem[stem] = cam
+        
+        vote_views = []
+        used = set()
+        for obj_id in obj_ids:
+            found = None
+            for stem, cam in cam_by_stem.items():
+                p = os.path.join(mask_root, stem, f"obj_{int(obj_id):04d}.png")
+                if os.path.exists(p):
+                    found = cam
+                    break
+            if found is not None:
+                key = os.path.splitext(os.path.basename(found.image_name))[0]
+                if key not in used:
+                    used.add(key)
+                    vote_views.append(found)
+        
+        # 回退：如果没有找到视图，使用一些视图
+        if not vote_views:
+            max_views = 24
+            if len(cams) <= max_views:
+                vote_views = cams
+            else:
+                step = max(int(len(cams) // max_views), 1)
+                vote_views = cams[::step][:max_views]
+        
+        # 限制视图数量以加速调试
+        vote_views = vote_views[:10]
+        print(f"[DEBUG] Using {len(vote_views)} vote views for semantic labeling")
+        
+        xyz = self.gaussians.get_xyz.detach()  # (N,3) on cuda
+        N = int(xyz.shape[0])
+        if N == 0:
+            print("Warning: No Gaussians to assign labels to")
+            return
+        
+        # 初始化语义标签为-1（未标记）
+        semantic_tensor = torch.full((N,), -1, dtype=torch.long, device=xyz.device)
+        
+        # 缓存掩码以避免重复加载
+        _mask_cache = {}
+        def _load_mask(stem: str, obj_id: int, H: int, W: int, device) -> Optional[torch.Tensor]:
+            cache_key = (stem, obj_id, H, W)
+            if cache_key in _mask_cache:
+                return _mask_cache[cache_key].to(device=device)
+            p = os.path.join(mask_root, stem, f"obj_{int(obj_id):04d}.png")
+            if not os.path.exists(p):
+                return None
+            m = Image.open(p).convert("L")
+            arr = torch.from_numpy(np.array(m, dtype=np.uint8)).float() / 255.0
+            if int(arr.shape[0]) != int(H) or int(arr.shape[1]) != int(W):
+                arr = F.interpolate(arr[None, None, ...], size=(int(H), int(W)), mode="nearest")[0, 0]
+            tensor = arr[None, ...].to(device=device)
+            _mask_cache[cache_key] = tensor.cpu()  # 存储到CPU以减少GPU内存
+            return tensor
+        
+        # 为每个对象投票
+        total_objects = len(obj_ids)
+        processed = 0
+        for cam in vote_views:
+            H, W = int(cam.image_height), int(cam.image_width)
+            stem = os.path.splitext(os.path.basename(cam.image_name))[0]
+            # 投影到NDC
+            ndc = geom_transform_points(xyz, cam.full_proj_transform)
+            x = ndc[:, 0]
+            y = ndc[:, 1]
+            z = ndc[:, 2]
+            ix = ((x + 1.0) * 0.5 * float(W)).long()
+            iy = ((1.0 - y) * 0.5 * float(H)).long()
+            valid = (ix >= 0) & (ix < W) & (iy >= 0) & (iy < H) & (z > 0)
+            if not bool(valid.any().item()):
+                continue
+            vidx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            ixv = ix[vidx]
+            iyv = iy[vidx]
+            
+            for obj_id in obj_ids:
+                # 获取对象的类别
+                obj_info = semantic_labels.get(str(obj_id))
+                if obj_info is None:
+                    continue
+                category = obj_info["category"]
+                category_id = category_to_id.get(category)
+                if category_id is None:
+                    print(f"Warning: Unknown category '{category}' for object {obj_id}")
+                    continue
+                
+                m = _load_mask(stem, obj_id, H, W, xyz.device)
+                if m is None:
+                    continue
+                
+                # 检查哪些高斯点在掩码内
+                inside = m[0, iyv, ixv] > 0.5
+                if inside.any():
+                    # 为在掩码内的高斯点分配类别ID
+                    # 如果有冲突（同一个高斯点属于多个对象），使用第一个遇到的类别
+                    mask_indices = vidx[inside]
+                    for idx in mask_indices:
+                        if semantic_tensor[idx] == -1:  # 只分配未标记的点
+                            semantic_tensor[idx] = category_id
+        
+        # 将语义标签分配给高斯模型
+        print(f"[DEBUG] Setting gaussians._semantic with shape {semantic_tensor.shape}")
+        self.gaussians._semantic = semantic_tensor
+        
+        # 统计分配情况
+        assigned = (semantic_tensor != -1).sum().item()
+        print(f"Assigned semantic labels to {assigned}/{N} Gaussians ({assigned/N*100:.1f}%)")
+        
+        # 打印每个类别的统计信息
+        category_counts = {}
+        for cat_name, cat_id in category_to_id.items():
+            count = (semantic_tensor == cat_id).sum().item()
+            if count > 0:
+                category_counts[cat_name] = count
+        
+        print("Category distribution:")
+        for cat_name, count in category_counts.items():
+            print(f"  {cat_name}: {count} Gaussians")

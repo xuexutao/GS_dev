@@ -54,7 +54,8 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool antialiasing,
 	const bool debug,
-	const torch::Tensor& mask)
+	const torch::Tensor& mask,
+	const torch::Tensor& tile_mask)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -120,7 +121,8 @@ RasterizeGaussiansCUDA(
 		antialiasing,
 		radii.contiguous().data<int>(),
 		debug,
-		mask.numel() > 0 ? mask.contiguous().data_ptr<float>() : nullptr);
+		mask.numel() > 0 ? mask.contiguous().data_ptr<float>() : nullptr,
+		tile_mask.numel() > 0 ? tile_mask.contiguous().data_ptr<float>() : nullptr);
   }
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth);
 }
@@ -219,8 +221,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dscales.contiguous().data<float>(),
 	  dL_drotations.contiguous().data<float>(),
 	  antialiasing,
-	  debug);
-  }
+	  debug,
+	  mask.numel() > 0 ? mask.contiguous().data_ptr<float>() : nullptr);
+	  }
 
   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations);
 }

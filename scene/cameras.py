@@ -83,8 +83,12 @@ class Camera(nn.Module):
         self.trans = trans
         self.scale = scale
 
-        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        self.world_view_transform = torch.tensor(
+            getWorld2View2(R, T, trans, scale), dtype=torch.float32, device=self.data_device
+        ).transpose(0, 1)
+        self.projection_matrix = getProjectionMatrix(
+            znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy
+        ).to(dtype=torch.float32, device=self.data_device).transpose(0, 1)
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
         
@@ -100,4 +104,3 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
-
