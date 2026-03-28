@@ -53,7 +53,8 @@ namespace CudaRasterizer
 			bool antialiasing,
 			int* radii = nullptr,
 			bool debug = false,
-			const float* mask = nullptr);
+			const float* mask = nullptr,
+			const float* tile_mask = nullptr);
 
 		static void backward(
 			const int P, int D, int M, int R,
@@ -88,7 +89,8 @@ namespace CudaRasterizer
 			float* dL_dscale,
 			float* dL_drot,
 			bool antialiasing,
-			bool debug);
+			bool debug,
+			const float* mask = nullptr);
 	};
 };
 

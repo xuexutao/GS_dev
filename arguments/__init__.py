@@ -118,6 +118,22 @@ class OptimizationParams(ParamGroup):
         # from the selected object only.
         self.mask_points3d_min_ratio = 0.5
         self.mask_points3d_min_count = 1
+
+        # =========================
+        # Foreground/Background dual training (mask + inpainting)
+        # =========================
+        # Enable dual-gaussian training: foreground optimized on masked original images,
+        # background optimized on inpainted images.
+        self.dual_enable = False
+        # Background images path.
+        # - If relative: interpreted as <source_path>/<dual_bg_images>
+        # - If absolute: used as-is
+        self.dual_bg_images = ""
+        # Loss weights
+        self.dual_w_fg = 1.0
+        self.dual_w_bg = 1.0
+        # Foreground render uses masked rasterizer (recommended for speed when masks are sparse)
+        self.dual_use_masked_rasterizer = True
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -16,10 +16,10 @@ def main():
         description="Generate SAM masks and enforce multi-view consistency using COLMAP tracks."
     )
     parser.add_argument("--source_path", required=True, help="Dataset root, contains images/ and sparse/0")
-    parser.add_argument("--images_subdir", default="images")
+    parser.add_argument("--images_subdir", default="images_4")
     parser.add_argument("--sparse_subdir", default=os.path.join("sparse", "0"))
-    parser.add_argument("--out_subdir", default=os.path.join("images", "masks_sam"))
-    parser.add_argument("--sam_checkpoint", required=True)
+    parser.add_argument("--out_subdir", default=os.path.join("images_4", "masks_sam"))
+    parser.add_argument("--sam_checkpoint", default="/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/segment-anything/weights/sam_vit_h_4b8939.pth")
     parser.add_argument("--sam_model_type", default="vit_h", choices=["vit_h", "vit_l", "vit_b"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dry_run", action="store_true", help="Do not load SAM; write a single full-image mask per view for sanity check")

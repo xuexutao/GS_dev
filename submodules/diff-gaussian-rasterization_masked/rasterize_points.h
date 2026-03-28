@@ -37,7 +37,8 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool antialiasing,
 	const bool debug,
-	const torch::Tensor& mask);
+	const torch::Tensor& mask,
+	const torch::Tensor& tile_mask);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(

@@ -192,7 +192,18 @@ def set_shared_attention(unet):
         if "attn1" in name and hasattr(module, 'processor'):
             module.set_processor(SharedAttentionProcessor())
 
-def inpaint_multiview(image_dir, mask_dir, out_dir, device="cuda"):
+def inpaint_multiview(
+    image_dir,
+    mask_dir,
+    out_dir,
+    device="cuda",
+    batch_size: int = 4,
+    max_images: int = -1,
+    num_inference_steps: int = 30,
+    guidance_scale: float = 7.5,
+    prompt: str = "background, natural scene, photorealistic, high quality",
+    negative_prompt: str = "artifacts, blur",
+):
     print("Loading Stable Diffusion Inpainting pipeline...")
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
         "runwayml/stable-diffusion-inpainting",
@@ -204,27 +215,30 @@ def inpaint_multiview(image_dir, mask_dir, out_dir, device="cuda"):
     # Apply multi-view shared attention
     set_shared_attention(pipe.unet)
     
-    image_paths = sorted(glob.glob(os.path.join(image_dir, "*.JPG")) + glob.glob(os.path.join(image_dir, "*.png")) + glob.glob(os.path.join(image_dir, "*.jpg")))
-    
-    # Process in chunks of 4 to avoid OOM, but retain 1st image as reference to maintain global consistency
-    # Wait, testing first 8 images for quick test.
-    test_images = image_paths[:8]
-    
-    batch_size = 4
+    image_paths = sorted(
+        glob.glob(os.path.join(image_dir, "*.JPG"))
+        + glob.glob(os.path.join(image_dir, "*.png"))
+        + glob.glob(os.path.join(image_dir, "*.jpg"))
+    )
+    if max_images is not None and int(max_images) > 0:
+        image_paths = image_paths[: int(max_images)]
     
     # Load all testing images and masks
     all_imgs = []
     all_masks = []
     valid_paths = []
     
-    for img_path in test_images:
+    for img_path in image_paths:
         img_name = os.path.basename(img_path)
         mask_path = os.path.join(mask_dir, img_name.replace(".JPG", ".png").replace(".jpg", ".png"))
         
         if not os.path.exists(mask_path):
             continue
             
-        img = Image.open(img_path).convert("RGB").resize((512, 512))
+        img_full = Image.open(img_path).convert("RGB")
+        orig_w, orig_h = img_full.size
+        # Run SD inpainting at 512 for stability, then resize back.
+        img = img_full.resize((512, 512))
         mask = Image.open(mask_path).convert("L").resize((512, 512))
         
         # Only inpaint if there is a mask
@@ -234,7 +248,7 @@ def inpaint_multiview(image_dir, mask_dir, out_dir, device="cuda"):
             valid_paths.append(img_path)
         else:
             # Just copy original
-            img.save(os.path.join(out_dir, img_name))
+            img_full.save(os.path.join(out_dir, img_name))
             
     # Process
     if len(all_imgs) == 0:
@@ -242,9 +256,6 @@ def inpaint_multiview(image_dir, mask_dir, out_dir, device="cuda"):
         return
         
     print(f"Inpainting {len(all_imgs)} images in chunks...")
-    
-    prompt = "background, natural scene, photorealistic, high quality"
-    negative_prompt = "bicycle, human, artifacts, blur"
     
     for i in tqdm(range(0, len(all_imgs), batch_size), desc="Inpainting chunks"):
         chunk_imgs = all_imgs[i:i+batch_size]
@@ -257,11 +268,15 @@ def inpaint_multiview(image_dir, mask_dir, out_dir, device="cuda"):
             negative_prompt=[negative_prompt] * len(chunk_imgs),
             image=chunk_imgs,
             mask_image=chunk_masks,
-            num_inference_steps=30,
-            guidance_scale=7.5
+            num_inference_steps=int(num_inference_steps),
+            guidance_scale=float(guidance_scale)
         ).images
         
         for res, p in zip(results, chunk_paths):
+            # Resize back to original resolution
+            full = Image.open(p).convert("RGB")
+            ow, oh = full.size
+            res = res.resize((ow, oh))
             res.save(os.path.join(out_dir, os.path.basename(p)))
 
 if __name__ == "__main__":
@@ -272,19 +287,37 @@ if __name__ == "__main__":
     parser.add_argument("--sparse_in", type=str, default="/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/data/gs_data/bicycle/sparse/0")
     parser.add_argument("--sparse_out", type=str, default="/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/MVInpainter/output/sparse/0")
     parser.add_argument("--inpaint_out", type=str, default="/mnt/bn/aidp-data-3d-lf1/xxt/merlin/gs/workspace/GS_dev/submodules/MVInpainter/output/inpainted_images")
+    parser.add_argument("--only_inpaint", action="store_true", help="Skip SAM/Colmap filtering, only run multi-view inpainting with provided masks")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--max_images", type=int, default=-1)
+    parser.add_argument("--num_inference_steps", type=int, default=30)
+    parser.add_argument("--guidance_scale", type=float, default=7.5)
+    parser.add_argument("--prompt", type=str, default="background, natural scene, photorealistic, high quality")
+    parser.add_argument("--negative_prompt", type=str, default="artifacts, blur")
     
     args = parser.parse_args()
     
-    # 1. SAM segmentation
-    print("=== Step 1: SAM Segmentation ===")
-    get_masks_for_bicycle(args.image_dir, args.mask_dir)
-    
-    # 2. COLMAP filtering
-    print("\n=== Step 2: COLMAP Filtering ===")
-    filter_bicycle_from_sfm(args.sparse_in, args.mask_dir, args.sparse_out)
-    
+    if not args.only_inpaint:
+        # 1. SAM segmentation
+        print("=== Step 1: SAM Segmentation ===")
+        get_masks_for_bicycle(args.image_dir, args.mask_dir)
+
+        # 2. COLMAP filtering
+        print("\n=== Step 2: COLMAP Filtering ===")
+        filter_bicycle_from_sfm(args.sparse_in, args.mask_dir, args.sparse_out)
+
     # 3. Multi-View Inpainting
     print("\n=== Step 3: Multi-View Inpainting ===")
-    inpaint_multiview(args.image_dir, args.mask_dir, args.inpaint_out)
+    inpaint_multiview(
+        args.image_dir,
+        args.mask_dir,
+        args.inpaint_out,
+        batch_size=int(args.batch_size),
+        max_images=int(args.max_images),
+        num_inference_steps=int(args.num_inference_steps),
+        guidance_scale=float(args.guidance_scale),
+        prompt=str(args.prompt),
+        negative_prompt=str(args.negative_prompt),
+    )
     
     print("\nAll done! Results saved to output directory.")

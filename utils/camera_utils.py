@@ -19,7 +19,8 @@ from tqdm import tqdm
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
-    image = Image.open(cam_info.image_path)
+    # Normalize image mode to avoid grayscale/palette surprises; keep alpha if present.
+    image = Image.open(cam_info.image_path).convert("RGBA")
 
     if cam_info.depth_path != "":
         try:
@@ -70,7 +71,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset, start_type):
     camera_list = []
 
-    for id, c in tqdm(enumerate(cam_infos)):
+    for id, c in tqdm(enumerate(cam_infos), desc="Loading cameras", total=len(cam_infos)):
         if start_type == 'debug' and id >= 2:
             break
         camera_list.append(loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset))

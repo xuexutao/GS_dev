@@ -10,6 +10,7 @@
 #
 
 import os
+import sys
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -32,6 +33,14 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+# Ensure we prefer the repo's CUDA extensions (avoid picking mismatched pip wheels).
+_REPO_ROOT = os.path.abspath(os.path.dirname(__file__))
+_LOCAL_RASTERIZER = os.path.join(_REPO_ROOT, "submodules", "diff-gaussian-rasterization_masked")
+_LOCAL_SIMPLE_KNN = os.path.join(_REPO_ROOT, "submodules", "simple-knn")
+for _p in (_LOCAL_RASTERIZER, _LOCAL_SIMPLE_KNN):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+
 try:
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
@@ -44,19 +53,74 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, semantic_labels_path=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians, mask_opt=opt)
-    gaussians.training_setup(opt)
-    if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+
+    dual_enable = bool(getattr(opt, "dual_enable", False))
+    dual_bg_images = str(getattr(opt, "dual_bg_images", "") or "")
+    
+    # 加载语义标签文件（如果提供）
+    semantic_labels = None
+    if semantic_labels_path and os.path.exists(semantic_labels_path):
+        print(f"Loading semantic labels from {semantic_labels_path}")
+        import json
+        with open(semantic_labels_path, 'r') as f:
+            semantic_labels = json.load(f)
+        print(f"Loaded {len(semantic_labels)} semantic labels")
+    elif semantic_labels_path:
+        print(f"Warning: Semantic labels file not found: {semantic_labels_path}")
+
+    def _clone_gaussians_init(dst: GaussianModel, src: GaussianModel) -> None:
+        """Clone GaussianModel params (without optimizer states)."""
+        dst.active_sh_degree = int(src.active_sh_degree)
+        dst.spatial_lr_scale = float(getattr(src, "spatial_lr_scale", 0.0))
+
+        dst._xyz = torch.nn.Parameter(src._xyz.detach().clone().requires_grad_(True))
+        dst._features_dc = torch.nn.Parameter(src._features_dc.detach().clone().requires_grad_(True))
+        dst._features_rest = torch.nn.Parameter(src._features_rest.detach().clone().requires_grad_(True))
+        dst._scaling = torch.nn.Parameter(src._scaling.detach().clone().requires_grad_(True))
+        dst._rotation = torch.nn.Parameter(src._rotation.detach().clone().requires_grad_(True))
+        dst._opacity = torch.nn.Parameter(src._opacity.detach().clone().requires_grad_(True))
+        dst.max_radii2D = torch.zeros_like(src.max_radii2D)
+
+        dst.exposure_mapping = dict(getattr(src, "exposure_mapping", {}))
+        dst.pretrained_exposures = getattr(src, "pretrained_exposures", None)
+        dst._exposure = torch.nn.Parameter(src._exposure.detach().clone().requires_grad_(True))
+
+    if dual_enable:
+        if not dual_bg_images:
+            raise RuntimeError("dual_enable=True 需要提供 --dual_bg_images (背景补全后的图片目录或子目录)")
+        if checkpoint:
+            raise RuntimeError("dual_enable=True 暂不支持从 checkpoint 恢复")
+
+        gaussians_fg = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+        scene = Scene(dataset, gaussians_fg, mask_opt=opt)
+
+        gaussians_bg = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+        _clone_gaussians_init(gaussians_bg, gaussians_fg)
+
+        gaussians_fg.training_setup(opt)
+        gaussians_bg.training_setup(opt)
+
+        # keep old name for downstream logger/report
+        gaussians = gaussians_fg
+    else:
+        gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+        scene = Scene(dataset, gaussians, mask_opt=opt)
+        gaussians.training_setup(opt)
+        if checkpoint:
+            (model_params, first_iter) = torch.load(checkpoint)
+            gaussians.restore(model_params, opt)
+
+    # 分配语义标签（如果提供了）
+    if semantic_labels is not None:
+        print(f"[DEBUG train.py] Calling assign_semantic_labels with {len(semantic_labels)} labels")
+        scene.assign_semantic_labels(semantic_labels)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -98,6 +162,53 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
 
     mask_cache = {}
+
+    bg_image_cache = {}
+
+    def _resolve_bg_image_root() -> str:
+        if not dual_enable:
+            return ""
+        if not dual_bg_images:
+            return ""
+        if os.path.isabs(dual_bg_images):
+            return dual_bg_images
+        return os.path.join(dataset.source_path, dual_bg_images)
+
+    def _load_bg_image_for_view(viewpoint_cam):
+        """Load background (inpainted) image as (3,H,W) float in [0,1]."""
+        root = _resolve_bg_image_root()
+        if not root:
+            return None
+        key = (root, viewpoint_cam.image_name, int(viewpoint_cam.image_height), int(viewpoint_cam.image_width))
+        if key in bg_image_cache:
+            return bg_image_cache[key]
+
+        H, W = int(viewpoint_cam.image_height), int(viewpoint_cam.image_width)
+        base = os.path.basename(viewpoint_cam.image_name)
+        stem, _ext = os.path.splitext(base)
+        candidates = [
+            os.path.join(root, base),
+            os.path.join(root, stem + ".png"),
+            os.path.join(root, stem + ".jpg"),
+            os.path.join(root, stem + ".JPG"),
+        ]
+        path = None
+        for p in candidates:
+            if os.path.exists(p):
+                path = p
+                break
+        if path is None:
+            # In some debug runs (or partial inpainting), background images may be missing.
+            # Returning None lets training fall back to original images.
+            return None
+
+        img = Image.open(path).convert("RGB")
+        t = torch.from_numpy(np.array(img, dtype=np.uint8)).float() / 255.0
+        t = t.permute(2, 0, 1)
+        if t.shape[1] != H or t.shape[2] != W:
+            t = F.interpolate(t[None], size=(H, W), mode="bilinear", align_corners=False)[0]
+        bg_image_cache[key] = t
+        return t
 
     def _load_object_masks_for_view(viewpoint_cam):
         """Load list of object masks (1,H,W) in [0,1], resized to current training resolution."""
@@ -215,11 +326,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record() # 记录当前迭代开始时间
 
-        gaussians.update_learning_rate(iteration)
+        if dual_enable:
+            gaussians_fg.update_learning_rate(iteration)
+            gaussians_bg.update_learning_rate(iteration)
+        else:
+            gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
-            gaussians.oneupSHdegree()
+            if dual_enable:
+                gaussians_fg.oneupSHdegree()
+                gaussians_bg.oneupSHdegree()
+            else:
+                gaussians.oneupSHdegree()
 
         # Pick a random Camera
         if not viewpoint_stack:
@@ -235,129 +354,212 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        # If mask_only is enabled and we want to use the masked rasterizer, avoid the unmasked render
-        # (it may include verbose CUDA debug prints in some builds, and is unnecessary for gradients).
-        if getattr(opt, "mask_only", False) and opt.mask_use_masked_rasterizer:
+        if dual_enable:
             obj_masks = _load_object_masks_for_view(viewpoint_cam)
-            if not obj_masks:
-                raise RuntimeError(
-                    f"mask_only is enabled but no masks found for view {viewpoint_cam.image_name}. "
-                    f"Expected: <source>/<images>/{opt.mask_dirname}/{os.path.splitext(os.path.basename(viewpoint_cam.image_name))[0]}/obj_*.png"
+            if obj_masks:
+                obj_masks = [m.to(device=bg.device) for m in obj_masks]
+                union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
+            else:
+                union_mask = None
+
+            render_pkg_fg = None
+            if union_mask is not None:
+                render_pkg_fg = render(
+                    viewpoint_cam,
+                    gaussians_fg,
+                    pipe,
+                    bg,
+                    use_trained_exp=dataset.train_test_exp,
+                    separate_sh=SPARSE_ADAM_AVAILABLE,
+                    mask=union_mask,
+                    use_masked_rasterizer=bool(getattr(opt, "dual_use_masked_rasterizer", True)),
+                    apply_mask_in_forward=False,
                 )
-            obj_masks = [m.to(device=bg.device) for m in obj_masks]
-            union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
-            render_pkg = render(
+            render_pkg_bg = render(
                 viewpoint_cam,
-                gaussians,
-                pipe,
-                bg,
-                use_trained_exp=dataset.train_test_exp,
-                separate_sh=SPARSE_ADAM_AVAILABLE,
-                mask=union_mask,
-                use_masked_rasterizer=True,
-                apply_mask_in_forward=False,
-            )
-        else:
-            render_pkg = render(
-                viewpoint_cam,
-                gaussians,
+                gaussians_bg,
                 pipe,
                 bg,
                 use_trained_exp=dataset.train_test_exp,
                 separate_sh=SPARSE_ADAM_AVAILABLE,
             )
 
-        image, viewspace_point_tensor, visibility_filter, radii = (
-            render_pkg["render"],
-            render_pkg["viewspace_points"],
-            render_pkg["visibility_filter"],
-            render_pkg["radii"],
-        )
+            if render_pkg_fg is not None:
+                image_fg, viewspace_fg, vis_fg, radii_fg = (
+                    render_pkg_fg["render"],
+                    render_pkg_fg["viewspace_points"],
+                    render_pkg_fg["visibility_filter"],
+                    render_pkg_fg["radii"],
+                )
+            else:
+                image_fg, viewspace_fg, vis_fg, radii_fg = (None, None, None, None)
+            image_bg, viewspace_bg, vis_bg, radii_bg = (
+                render_pkg_bg["render"],
+                render_pkg_bg["viewspace_points"],
+                render_pkg_bg["visibility_filter"],
+                render_pkg_bg["radii"],
+            )
+        else:
+            # If mask_only is enabled and we want to use the masked rasterizer, avoid the unmasked render
+            # (it may include verbose CUDA debug prints in some builds, and is unnecessary for gradients).
+            if getattr(opt, "mask_only", False) and opt.mask_use_masked_rasterizer:
+                obj_masks = _load_object_masks_for_view(viewpoint_cam)
+                if not obj_masks:
+                    raise RuntimeError(
+                        f"mask_only is enabled but no masks found for view {viewpoint_cam.image_name}. "
+                        f"Expected: <source>/<images>/{opt.mask_dirname}/{os.path.splitext(os.path.basename(viewpoint_cam.image_name))[0]}/obj_*.png"
+                    )
+                obj_masks = [m.to(device=bg.device) for m in obj_masks]
+                union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
+                render_pkg = render(
+                    viewpoint_cam,
+                    gaussians,
+                    pipe,
+                    bg,
+                    use_trained_exp=dataset.train_test_exp,
+                    separate_sh=SPARSE_ADAM_AVAILABLE,
+                    mask=union_mask,
+                    use_masked_rasterizer=True,
+                    apply_mask_in_forward=False,
+                )
+            else:
+                render_pkg = render(
+                    viewpoint_cam,
+                    gaussians,
+                    pipe,
+                    bg,
+                    use_trained_exp=dataset.train_test_exp,
+                    separate_sh=SPARSE_ADAM_AVAILABLE,
+                )
+
+            image, viewspace_point_tensor, visibility_filter, radii = (
+                render_pkg["render"],
+                render_pkg["viewspace_points"],
+                render_pkg["visibility_filter"],
+                render_pkg["radii"],
+            )
 
         if viewpoint_cam.alpha_mask is not None:
-            alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
+            alpha_mask = viewpoint_cam.alpha_mask.to(device=bg.device)
+            if dual_enable:
+                if image_fg is not None:
+                    image_fg *= alpha_mask
+                image_bg *= alpha_mask
+            else:
+                image *= alpha_mask
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.original_image.to(device=bg.device)
 
-        # Optional: object-only training (only optimize pixels inside selected mask)
-        if getattr(opt, "mask_only", False):
-            # When opt.mask_use_masked_rasterizer is enabled, `render_pkg` above already used it.
-            obj_masks = _load_object_masks_for_view(viewpoint_cam)
-            if not obj_masks:
-                raise RuntimeError(
-                    f"mask_only is enabled but no masks found for view {viewpoint_cam.image_name}. "
-                    f"Expected: <source>/<images>/{opt.mask_dirname}/{os.path.splitext(os.path.basename(viewpoint_cam.image_name))[0]}/obj_*.png"
-                )
-            obj_masks = [m.to(device=image.device) for m in obj_masks]
-            union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
-            mask3 = union_mask.expand_as(image)
-
-            Ll1 = _masked_l1(image, gt_image, union_mask)
-            if FUSED_SSIM_AVAILABLE:
-                ssim_value = fused_ssim(
-                    (image * mask3).unsqueeze(0),
-                    (gt_image * mask3).unsqueeze(0),
-                )
+        if dual_enable:
+            bg_gt = _load_bg_image_for_view(viewpoint_cam)
+            if bg_gt is None:
+                bg_gt = gt_image.detach()
             else:
-                ssim_value = ssim(image * mask3, gt_image * mask3)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        else:
-            Ll1 = l1_loss(image, gt_image)
-            if FUSED_SSIM_AVAILABLE:
-                ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                bg_gt = bg_gt.to(device=gt_image.device)
+
+            if image_fg is not None and union_mask is not None:
+                mask3 = union_mask.expand_as(image_fg)
+                Ll1_fg = _masked_l1(image_fg, gt_image, union_mask)
+                if FUSED_SSIM_AVAILABLE:
+                    ssim_fg = fused_ssim((image_fg * mask3).unsqueeze(0), (gt_image * mask3).unsqueeze(0))
+                else:
+                    ssim_fg = ssim(image_fg * mask3, gt_image * mask3)
+                loss_fg = (1.0 - opt.lambda_dssim) * Ll1_fg + opt.lambda_dssim * (1.0 - ssim_fg)
             else:
-                ssim_value = ssim(image, gt_image)
+                Ll1_fg = torch.zeros((), device=gt_image.device)
+                loss_fg = torch.zeros((), device=gt_image.device)
 
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            Ll1_bg = l1_loss(image_bg, bg_gt)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_bg = fused_ssim(image_bg.unsqueeze(0), bg_gt.unsqueeze(0))
+            else:
+                ssim_bg = ssim(image_bg, bg_gt)
+            loss_bg = (1.0 - opt.lambda_dssim) * Ll1_bg + opt.lambda_dssim * (1.0 - ssim_bg)
 
-            # Mask loss (optional): full-image loss + object-mask losses
-            if opt.mask_loss_weight > 0.0:
+            w_fg = float(getattr(opt, "dual_w_fg", 1.0))
+            w_bg = float(getattr(opt, "dual_w_bg", 1.0))
+            Ll1 = (w_fg * Ll1_fg + w_bg * Ll1_bg)
+            loss = w_fg * loss_fg + w_bg * loss_bg
+
+        if not dual_enable:
+            # Optional: object-only training (only optimize pixels inside selected mask)
+            if getattr(opt, "mask_only", False):
+                # When opt.mask_use_masked_rasterizer is enabled, `render_pkg` above already used it.
                 obj_masks = _load_object_masks_for_view(viewpoint_cam)
-                if obj_masks:
-                    obj_masks = [m.to(device=image.device) for m in obj_masks]
-                    union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
+                if not obj_masks:
+                    raise RuntimeError(
+                        f"mask_only is enabled but no masks found for view {viewpoint_cam.image_name}. "
+                        f"Expected: <source>/<images>/{opt.mask_dirname}/{os.path.splitext(os.path.basename(viewpoint_cam.image_name))[0]}/obj_*.png"
+                    )
+                obj_masks = [m.to(device=image.device) for m in obj_masks]
+                union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
+                mask3 = union_mask.expand_as(image)
 
-                    # Per-object masked loss on current rendered image
-                    per_obj = 0.0
-                    for m in obj_masks:
-                        per_obj = per_obj + _masked_l1(image, gt_image, m)
-                    per_obj = per_obj / float(len(obj_masks))
+                Ll1 = _masked_l1(image, gt_image, union_mask)
+                if FUSED_SSIM_AVAILABLE:
+                    ssim_value = fused_ssim(
+                        (image * mask3).unsqueeze(0),
+                        (gt_image * mask3).unsqueeze(0),
+                    )
+                else:
+                    ssim_value = ssim(image * mask3, gt_image * mask3)
+                loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            else:
+                Ll1 = l1_loss(image, gt_image)
+                if FUSED_SSIM_AVAILABLE:
+                    ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                else:
+                    ssim_value = ssim(image, gt_image)
 
-                    # Optional: run a second render path that uses masked rasterizer (mask applied in forward/backward)
-                    if opt.mask_use_masked_rasterizer:
-                        render_pkg_masked = render(
-                            viewpoint_cam,
-                            gaussians,
-                            pipe,
-                            bg,
-                            use_trained_exp=dataset.train_test_exp,
-                            separate_sh=SPARSE_ADAM_AVAILABLE,
-                            mask=union_mask,
-                            use_masked_rasterizer=True,
-                            apply_mask_in_forward=True,
-                        )
-                        image_masked = render_pkg_masked["render"]
-                        union_obj = _masked_l1(image_masked, gt_image, union_mask)
-                    else:
-                        union_obj = _masked_l1(image, gt_image, union_mask)
+                loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-                    if opt.mask_pack_loss:
-                        packed = _packed_mask_loss(image, gt_image, obj_masks, int(opt.mask_pack_size))
-                    else:
-                        packed = None
+                # Mask loss (optional): full-image loss + object-mask losses
+                if opt.mask_loss_weight > 0.0:
+                    obj_masks = _load_object_masks_for_view(viewpoint_cam)
+                    if obj_masks:
+                        obj_masks = [m.to(device=image.device) for m in obj_masks]
+                        union_mask = torch.clamp(torch.stack(obj_masks, dim=0).sum(dim=0), 0.0, 1.0)
 
-                    if packed is None:
-                        mask_loss = 0.5 * union_obj + 0.5 * per_obj
-                    else:
-                        mask_loss = (union_obj + per_obj + packed) / 3.0
-                    loss = loss + float(opt.mask_loss_weight) * mask_loss
+                        # Per-object masked loss on current rendered image
+                        per_obj = 0.0
+                        for m in obj_masks:
+                            per_obj = per_obj + _masked_l1(image, gt_image, m)
+                        per_obj = per_obj / float(len(obj_masks))
+
+                        # Optional: run a second render path that uses masked rasterizer (mask applied in forward/backward)
+                        if opt.mask_use_masked_rasterizer:
+                            render_pkg_masked = render(
+                                viewpoint_cam,
+                                gaussians,
+                                pipe,
+                                bg,
+                                use_trained_exp=dataset.train_test_exp,
+                                separate_sh=SPARSE_ADAM_AVAILABLE,
+                                mask=union_mask,
+                                use_masked_rasterizer=True,
+                                apply_mask_in_forward=True,
+                            )
+                            image_masked = render_pkg_masked["render"]
+                            union_obj = _masked_l1(image_masked, gt_image, union_mask)
+                        else:
+                            union_obj = _masked_l1(image, gt_image, union_mask)
+
+                        if opt.mask_pack_loss:
+                            packed = _packed_mask_loss(image, gt_image, obj_masks, int(opt.mask_pack_size))
+                        else:
+                            packed = None
+
+                        if packed is None:
+                            mask_loss = 0.5 * union_obj + 0.5 * per_obj
+                        else:
+                            mask_loss = (union_obj + per_obj + packed) / 3.0
+                        loss = loss + float(opt.mask_loss_weight) * mask_loss
 
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
+            invDepth = (render_pkg_bg["depth"] if dual_enable else render_pkg["depth"])
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
@@ -388,31 +590,79 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if dual_enable:
+                    point_cloud_path = os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration))
+                    gaussians_bg.save_ply(os.path.join(point_cloud_path, "point_cloud_bg.ply"))
+                    try:
+                        exposure_dict_bg = {
+                            image_name: gaussians_bg.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
+                            for image_name in gaussians_bg.exposure_mapping
+                        }
+                        with open(os.path.join(scene.model_path, "exposure_bg.json"), "w") as f:
+                            import json as _json
+                            _json.dump(exposure_dict_bg, f, indent=2)
+                    except Exception as e:
+                        print(f"[WARN] Failed to save exposure_bg.json: {e}")
 
             # Densification
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                if dual_enable:
+                    if radii_fg is not None and vis_fg is not None:
+                        gaussians_fg.max_radii2D[vis_fg] = torch.max(gaussians_fg.max_radii2D[vis_fg], radii_fg[vis_fg])
+                        gaussians_fg.add_densification_stats(viewspace_fg, vis_fg)
+                    gaussians_bg.max_radii2D[vis_bg] = torch.max(gaussians_bg.max_radii2D[vis_bg], radii_bg[vis_bg])
+                    gaussians_bg.add_densification_stats(viewspace_bg, vis_bg)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        if radii_fg is not None:
+                            gaussians_fg.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii_fg)
+                        gaussians_bg.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii_bg)
+
+                    if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                        gaussians_fg.reset_opacity()
+                        gaussians_bg.reset_opacity()
+                else:
+                    # Keep track of max radii in image-space for pruning
+                    gaussians.max_radii2D[visibility_filter] = torch.max(
+                        gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
+                    )
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+
+                    if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                        gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
-                if use_sparse_adam:
-                    visible = radii > 0
-                    gaussians.optimizer.step(visible, radii.shape[0])
-                    gaussians.optimizer.zero_grad(set_to_none = True)
+                if dual_enable:
+                    for g, r in [(gaussians_fg, radii_fg), (gaussians_bg, radii_bg)]:
+                        g.exposure_optimizer.step()
+                        g.exposure_optimizer.zero_grad(set_to_none=True)
+                        if use_sparse_adam:
+                            if r is not None:
+                                visible = r > 0
+                                g.optimizer.step(visible, r.shape[0])
+                                g.optimizer.zero_grad(set_to_none=True)
+                            else:
+                                # No foreground render this iter (missing mask): skip sparse optimizer step.
+                                g.optimizer.zero_grad(set_to_none=True)
+                        else:
+                            g.optimizer.step()
+                            g.optimizer.zero_grad(set_to_none=True)
                 else:
-                    gaussians.optimizer.step()
-                    gaussians.optimizer.zero_grad(set_to_none = True)
+                    gaussians.exposure_optimizer.step()
+                    gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                    if use_sparse_adam:
+                        visible = radii > 0
+                        gaussians.optimizer.step(visible, radii.shape[0])
+                        gaussians.optimizer.zero_grad(set_to_none = True)
+                    else:
+                        gaussians.optimizer.step()
+                        gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -458,7 +708,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    gt_image = torch.clamp(viewpoint.original_image.to(device=image.device), 0.0, 1.0)
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
@@ -496,6 +746,8 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--semantic_labels", type=str, default=None,
+                        help="Path to labels.json file containing semantic label mapping")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -508,7 +760,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.semantic_labels)
 
     # All done
     print("\nTraining complete.")
